@@ -19,6 +19,7 @@ class EvidenceSnapshot:
     imported_culture_end: date | None
     imported_enrichments: int | None = None
     ward_types: dict[str, str] = field(default_factory=dict)
+    includes_feed_data: bool = False
 
 
 class EvidenceUnavailable(ValueError):
@@ -52,9 +53,13 @@ def snapshot_from_connection(db, run_id: str | None = None) -> EvidenceSnapshot:
                    db.execute("SELECT payload FROM antibiotics").fetchall()]
     ward_types = {row[0]: row[1]["ward_type"] for row in db.execute("SELECT ward_code, payload FROM wards")}
     wards = frozenset(ward_types)
-    count, start, end = db.execute("SELECT COUNT(*), MIN(sample_date), MAX(sample_date) FROM culture_events").fetchone()
-    enriched = db.execute("SELECT COUNT(*) FROM isolate_enrichments").fetchone()[0]
+    count, start, end = db.execute("SELECT COUNT(*), MIN(sample_date), MAX(sample_date) FROM culture_events WHERE origin='dataset'").fetchone()
+    enriched = db.execute("SELECT COUNT(*) FROM isolate_enrichments WHERE origin='dataset'").fetchone()[0]
+    if run_id:
+        includes_feed = db.execute("SELECT payload->>'feed_data_digest' IS NOT NULL FROM replay_runs WHERE run_id=%s", (run_id,)).fetchone()[0]
+    else:
+        includes_feed = db.execute("SELECT EXISTS(SELECT 1 FROM culture_events WHERE origin='feed')").fetchone()[0]
     return EvidenceSnapshot(events=events, enrichments={item.event_id: item for item in metadata},
         antibiotics={item.antibiotic_code: item for item in antibiotics}, ward_codes=wards,
         manifest=manifest, imported_cultures=count, imported_culture_start=start, imported_culture_end=end,
-        imported_enrichments=enriched, ward_types=ward_types)
+        imported_enrichments=enriched, ward_types=ward_types, includes_feed_data=includes_feed)

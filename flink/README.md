@@ -3,11 +3,18 @@
 There is intentionally no fake Flink job or placeholder running service here.
 The first milestones establish event and output contracts, a PostgreSQL source,
 and tested reference results that the real Flink job must reproduce.
+External feed ingestion, durable receipts and SSE dashboard notifications are already
+implemented in Python/PostgreSQL; they do not require Flink. See
+[the feed contract](../FEED_INTEGRATION.md). Flink remains deferred.
 
 ## Stable contracts
 
 - Input: `aei.models.IsolateEvent`, schema version 1. Generate JSON Schema with
   `python -m aei schema`. Corrections are full snapshots with higher revisions.
+- Complete publication input: `aei.feed_models.FeedBatch`, including cultures,
+  revision-bound metadata and negative specimens. Published run membership and the
+  reporting clock determine visibility; a job must not consume staged future events
+  as if they had already been published. Consume complete committed versions.
 - Query/rules: `AnalysisQuery`; current output identifies `prototype-v2`. Annual
   means rolling 12 calendar months; the other standard period is rolling 28 days.
 - Output: `AnalysisResult` and `Statistic`. Missing percentages stay null.
@@ -24,7 +31,9 @@ synchronously through the Python reference processor interface.
 
 1. PostgreSQL storage and Docker Compose are implemented. Logical WAL is enabled;
    a replication user, publication and slot still need to be configured for Flink.
-2. Configure Flink CDC for the input table only; output tables must not feed back.
+2. Design CDC around committed complete-bundle publication and clock changes, including
+   metadata and negative specimens; isolate events alone cannot reproduce enriched
+   evidence or run visibility. Output tables must not feed back into source processing.
 3. Implement revision handling and keyed first-isolate state per configured scope.
    Retain later candidates: an isolate that is not first today can become first
    when the old one expires. Keep annual and rolling selections independent.
@@ -38,7 +47,10 @@ synchronously through the Python reference processor interface.
    before deployment; no connector compatibility has been tested in this slice.
 7. Compare Flink output against the reference processor for the same data, clock,
    rule version and filters, including failures and out-of-order corrections.
-8. Add alert evaluation only after its baseline and thresholds are agreed.
+8. Reproduce the existing versioned alert evaluations, lifecycle and frozen reports
+   before replacing the Python implementation. Current thresholds and monitor groups
+   still need partner confirmation. Emit SSE notifications only after the complete
+   result/alert version commits, using the existing durable notification log.
 
 The existing synthetic source has day-level dates and no arrival times. Do not
 silently reinterpret its replay timestamps as real result-reporting timestamps.

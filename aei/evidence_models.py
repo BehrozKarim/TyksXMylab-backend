@@ -53,6 +53,8 @@ class MetadataCompleteness(StrictModel):
 
 
 class SourceCoverage(StrictModel):
+    coverage_scope: Literal["imported_dataset_only"] = "imported_dataset_only"
+    includes_feed_data: bool = False
     source_start: date | None
     source_end: date | None
     overlap_start: date | None

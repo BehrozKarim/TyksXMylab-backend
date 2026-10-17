@@ -93,7 +93,7 @@ class AlertEngine:
             VALUES (%s, %s, %s, 'alert-v1', 'alert', %s, %s)""",
             (report.analysis_id, state.run_id, state.state_revision, monitor.monitor_id,
              Jsonb(report.model_dump(mode="json"))))
-        return report
+        return SavedAlertAnalysis.model_validate(report.model_dump(mode="json"))
 
     def evaluate(self, db, state):
         configuration = self.configuration_for(db, state.run_id)

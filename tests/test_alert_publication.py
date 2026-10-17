@@ -20,6 +20,8 @@ from aei.alert_scenario import write_alert_scenario
 from aei.alerts import advance_alert
 from aei.api import create_app
 from aei.dataset import load_bundle
+from aei.feed_models import FeedStart
+from aei.feed_sender import batches
 from aei.postgres import PostgresEventStore
 from aei.publication import PublicationService, export_csv
 from aei.publication_models import ExpectedState, ReplayReset, ReplayStart, ServiceError
@@ -92,6 +94,28 @@ class AlertPublicationTests(unittest.TestCase):
                          ["new", "insufficient_evidence", "cleared", "ongoing"])
         with self.store.connection() as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM alerts WHERE run_id=%s", (self.state.run_id,)).fetchone()[0], 1)
+        self.assertEqual(self.store.count(), len(self.bundle.events))
+
+    def test_feed_batches_drive_real_alert_lifecycle_and_committed_notifications(self):
+        state = self.service.feed.start(FeedStart(source_id="scenario", source_label="Authored feed scenario",
+            clock_mode="simulated", as_of="2026-09-26", seed_through="2026-09-26"))
+        cursor, _ = self.service.updates.begin()
+        states, identities = [], []
+        for batch in batches(self.bundle, state.run_id, "scenario", date(2026, 9, 27), date(2026, 10, 1)):
+            receipt = self.service.feed.submit(batch)
+            self.service.feed.worker_tick()
+            self.assertEqual(self.service.feed.receipt(receipt.receipt_id).status, "published")
+            listing = self.listing(states=ALL_STATES)
+            alert = listing.alerts[0]
+            states.append(alert.status)
+            identities.append(alert.alert_id)
+            rows = self.service.updates.read_after(cursor)
+            self.assertEqual(len(rows), 1)
+            cursor, notification = rows[0]
+            self.assertEqual(notification["state_revision"], listing.monitoring_revision)
+            self.assertEqual(notification["demo_date"], listing.monitoring_as_of.isoformat())
+        self.assertEqual(states, ["new", "insufficient_evidence", "cleared", "ongoing", "ongoing"])
+        self.assertEqual(len(set(identities)), 1)
         self.assertEqual(self.store.count(), len(self.bundle.events))
 
     def test_reads_retries_and_start_pause_do_not_duplicate_or_advance_alert_lifecycle(self):
@@ -214,7 +238,8 @@ class AlertPublicationTests(unittest.TestCase):
         self.assertEqual(listing.monitoring_as_of, date(2026, 9, 27))
         self.assertEqual(len(self.service.investigation(listing.alerts[0].alert_id, ExpectedState()).transitions), 1)
 
-    def test_reader_waits_for_whole_publication_including_alerts(self):
+    def test_reader_sees_last_committed_alerts_while_next_publication_is_in_progress(self):
+        before = self.listing()
         entered, release = threading.Event(), threading.Event()
         evaluate = self.service.alert_engine.evaluate
 
@@ -229,10 +254,11 @@ class AlertPublicationTests(unittest.TestCase):
             try:
                 self.assertTrue(entered.wait(timeout=10))
                 reader = pool.submit(self.listing)
-                self.assertFalse(reader.done())
+                self.assertEqual(reader.result(timeout=5), before)
             finally:
                 release.set()
-            state, report = writer.result(timeout=10), reader.result(timeout=10)
+            state = writer.result(timeout=10)
+        report = self.listing()
         self.assertEqual(report.state_revision, state.state_revision)
         self.assertEqual(report.monitoring_as_of, state.demo_date)
         self.assertEqual(report.monitors[0].evaluation.recent.n_tested, 30)

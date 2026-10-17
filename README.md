@@ -1,12 +1,15 @@
 # Tyks AEI backend
 
-Current flow: **CSV archive/folder -> validated source bundles in PostgreSQL -> published
-replay run -> Python reference processor -> saved evidence, resistance alerts and JSON/CSV exports**.
+Current flow: **CSV seed + external HTTP feed -> durable PostgreSQL history/queue ->
+published run -> Python reference processor and alerts -> SSE dashboard notifications**.
+Evidence, comparisons, patient history and investigations retain saved JSON/CSV exports.
 The original event-ingestion and statistics endpoints also remain available.
 PostgreSQL runs in Docker with a persistent
 volume. Annual results now mean **rolling last 12 calendar months**, alongside the
 rolling last 28 days. The backend includes configurable resistance alerts and
-investigation APIs. Flink and a dashboard are not active yet.
+investigation APIs, complete-culture feed ingestion and reconnectable live updates.
+Flink and a dashboard are not active yet. See [feed integration and the dashboard
+handoff](FEED_INTEGRATION.md) for the sender, API contract and EventSource example.
 
 ## Start the database and backend
 
@@ -21,7 +24,8 @@ docker compose up -d --wait postgres
 
 The default development connection is
 `postgresql://aei:aei_local_only@127.0.0.1:55432/aei`. The port is bound to loopback.
-Override the backend connection with `AEI_DATABASE_URL`. Compose also accepts
+Override the backend connection with `AEI_DATABASE_URL` and the API/CLI schema with
+`AEI_DATABASE_SCHEMA` (default `aei`; CLI `--schema` takes precedence). Compose also accepts
 `POSTGRES_PASSWORD` and `POSTGRES_PORT` overrides; set a matching backend URL when
 changing them. A password environment change does not reset an existing volume's
 database password. Use these default credentials only for local development.
@@ -131,12 +135,17 @@ comparison APIs read only the records published in that view.
 - `GET /api/v1/analyses/{analysis_id}`: retrieve the original saved response.
 - `GET /api/v1/analyses/{analysis_id}/export?format=json|csv`: download that response.
 - `POST /api/v1/replay/reset|start|pause|step`: control the synthetic replay.
+- `POST /api/v1/feed/start`: create a receiving run with simulated or UTC wall clock.
+- `POST /api/v1/feed/batches`: durably accept complete cultures; return a 202 receipt.
+- `GET /api/v1/feed/receipts/{id}` and `POST .../{id}/retry`: inspect or retry delivery.
+- `GET /api/v1/updates`: SSE committed-state notifications with reconnect recovery.
 
 Filters: `ward_code`, `organism`, `specimen`, `antibiotic_code`, `dedup_scope`.
 `known_at` optionally restricts results to revisions received by that timestamp.
 `as_of` controls sample dates, not knowledge time. Without `known_at`, the latest
 known revisions are used. Legacy statistics require an explicit `as_of`; published
-evidence defaults to the run's demo date. Neither uses the computer's date implicitly.
+evidence defaults to the run's reporting date. Replay/simulated feed clocks are explicit;
+`wall_utc` feed mode advances its reporting date with the current UTC day.
 
 ### Enriched evidence
 
@@ -228,7 +237,9 @@ For coordinated reads, send `expected_run_id` and `expected_revision` together, 
 `/api/v1/state`. Evidence, comparison, patient search, history, alerts and investigations accept them as query parameters; replay controls accept them
 in the JSON body. A mismatch returns HTTP 409 with `error.details.state` and creates
 no analysis. Omitting both uses whichever state is current when the request acquires
-the lock. Clients may poll state every two seconds; push notifications are not implemented.
+the lock. Clients can subscribe to `/api/v1/updates` and refresh on committed changes;
+polling `/state` remains a fallback. State and alert reads return the last committed
+revision while a worker processes the next batch. See [the SSE handoff](FEED_INTEGRATION.md#dashboard-handoff).
 
 Versioned errors consistently use
 `{"error":{"code":"...","message":"...","details":{}},"request_id":"..."}`,
@@ -536,11 +547,12 @@ membership, demo date, revision and alert evaluations together. Reset never dele
 old reports. The metadata catalogs describe the full source, while evidence reads
 only exact event IDs published in the active run.
 
-This is a synthetic simulation, not a live Tyks connection. Legacy `/events` writes
-retain their original history/statistics behavior but **do not publish into replay**,
-including corrections. An external complete-bundle publication adapter is still needed
-before using the versioned evidence API with a live feed. State explicitly labels
-this behavior as `legacy_event_ingestion: history_only`.
+This replay is a synthetic simulation, not a live Tyks connection. Legacy `/events`
+writes retain their original history/statistics behavior but **do not publish into
+the active run**, including corrections. State labels this as
+`legacy_event_ingestion: history_only`. Use the [complete-culture HTTP feed](FEED_INTEGRATION.md)
+to publish external arrivals with metadata, alerts and live notifications. Its standalone
+dataset sender demonstrates arrivals without changing the original dates or files.
 
 ## Verify
 
@@ -571,6 +583,10 @@ Alert tests cover disjoint calendar bounds, exact threshold arithmetic, counts a
 29/30, first-isolate and demographic rules, missing tests, timing/context counts,
 the full lifecycle, frozen configuration, archived investigations, schema upgrades,
 concurrent readers/steps, detector rollback, append-only history and saved exports.
+Feed tests cover complete-bundle validation, durable receipts, concurrent acceptance,
+retry idempotence, late data, full corrections, restart recovery, rollback and quiet-day
+expiration. A real HTTP server test exercises the sender, SSE delivery and reconnect
+recovery; an authored feed scenario verifies the full alert lifecycle.
 `python -m aei schema` prints the versioned input contract.
 
 The supplied-data check replayed all 28 days through 2026-09-27, ending with 46,792
@@ -591,11 +607,12 @@ the source specimens and every recorded AST result. Reset kept old history expor
 unchanged and hid future-only patient IDs. No source files or main event history changed.
 
 Still pending: partner confirmation of the proposed alert configuration and detailed
-counting policies, external complete-bundle publication, Flink, live notifications
-and the dashboard. Evidence, antibiotic comparison, patient history, alerts and
-investigation API views with saved exports are implemented. Calculations load published
-events in memory and serialize with replay publication; this is a correctness reference, not a
-production throughput claim. See [the Flink integration boundary](flink/README.md).
+counting policies, laboratory-specific access/mapping, dashboard integration and
+production operations. Flink is deferred. External HTTP feed publication and SSE are
+implemented alongside evidence, comparison, history, alerts and saved exports.
+Calculations load published events in memory and serialize with publication. The
+durable queue and bounded batches keep acceptance separate from analytical work;
+they do not provide a production throughput guarantee. See [the Flink integration boundary](flink/README.md).
 
 The alert upgrade passed **147 tests**, including 30 alert/scenario tests and real
 PostgreSQL integration tests. A separate supplied-data check matched independent SQL
@@ -607,3 +624,13 @@ frozen exports, the source archive and existing main event history remained unch
 With four monitors, that local check took about 22 seconds for initial full publication
 and 19 seconds for three daily steps. These timings include full in-memory snapshots
 and shared database locking; they are not a live-feed latency guarantee.
+
+The feed/SSE upgrade passed **174 tests** with real PostgreSQL integration enabled.
+A separate disposable-schema check sent the supplied dataset's final 39 cultures over
+HTTP, received the committed SSE update, and finished with 46,792 cultures and 24,571
+isolates visible. Retrying the same delivery preserved its receipt and revision; all
+four alert monitors matched the publication revision. Independent SQL reproduced the
+ED / E. coli / urine / CIP / female / age 65+ counts: 15 tested (15 S, 0 R) over 28 days
+and 210 tested (199 S, 11 R) over 12 months. That local delivery took about 2.8 seconds,
+excluding seed publication. Source bytes and the existing main event history were
+unchanged. The HTTP reconnect test separately verified delivery of missed notifications.

@@ -3,16 +3,17 @@
 import asyncio
 import logging
 import os
+import secrets
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 from uuid import uuid4
 
 import psycopg
-from fastapi import APIRouter, Body, Query, Request
+from fastapi import APIRouter, Body, Depends, Header, Query, Request
 from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import ValidationError
 from starlette.exceptions import HTTPException
 
@@ -21,6 +22,7 @@ from .alert_models import AlertList, AlertListRequest, Investigation
 from .analysis_models import (ComparisonRequest, HistoryRequest, PatientSearchRequest,
                               PatientSearchResult, SavedAnalysis, SavedComparison, SavedHistory)
 from .evidence_source import EvidenceUnavailable
+from .feed_models import FeedBatch, FeedReceipt, FeedStart
 from .publication import export_csv
 from .publication_models import (
     EvidenceRequest, ExpectedState, ReplayReset, ReplayStart, ReplayState, SavedEvidence, ServiceError,
@@ -32,24 +34,25 @@ def replay_lifespan(service):
     async def lifespan(app):
         stopped = asyncio.Event()
 
-        async def run():
+        async def run(tick):
             while not stopped.is_set():
                 try:
-                    await asyncio.to_thread(service.worker_tick)
+                    await asyncio.to_thread(tick)
                 except Exception:
-                    logging.getLogger(__name__).exception("Replay worker could not access state")
+                    logging.getLogger(__name__).exception("Background publication worker could not access state")
                 try:
                     await asyncio.wait_for(stopped.wait(), timeout=0.2)
                 except asyncio.TimeoutError:
                     pass
 
-        task = asyncio.create_task(run()) if service is not None else None
+        tasks = ([asyncio.create_task(run(tick)) for tick in (service.worker_tick, service.feed.worker_tick)]
+                 if service is not None else [])
         try:
             yield
         finally:
             stopped.set()
-            if task is not None:
-                await task  # Let an in-flight database transaction finish cleanly.
+            if tasks:
+                await asyncio.gather(*tasks)  # Finish in-flight database transactions.
     return lifespan
 
 
@@ -57,7 +60,8 @@ def install_v1(app, service):
     origins = [value.strip() for value in os.environ.get(
         "AEI_CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",") if value.strip()]
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["GET", "POST"],
-                       allow_headers=["Content-Type"], expose_headers=["X-Request-ID", "Content-Disposition"])
+                       allow_headers=["Content-Type", "Authorization", "Last-Event-ID"],
+                       expose_headers=["X-Request-ID", "Content-Disposition"])
 
     @app.middleware("http")
     async def identify(request, call_next):
@@ -121,6 +125,39 @@ def install_v1(app, service):
 
     router = APIRouter(prefix="/api/v1")
 
+    def feed_access(authorization: Annotated[str | None, Header()] = None):
+        token = os.environ.get("AEI_FEED_TOKEN")
+        if token and not secrets.compare_digest((authorization or "").encode(), f"Bearer {token}".encode()):
+            raise ServiceError(401, "feed_unauthorized", "A valid feed bearer token is required")
+
+    @router.post("/feed/start", response_model=ReplayState, dependencies=[Depends(feed_access)])
+    def feed_start(request: FeedStart):
+        return backend().feed.start(request)
+
+    @router.post("/feed/batches", response_model=FeedReceipt, status_code=202, dependencies=[Depends(feed_access)])
+    def feed_batch(request: FeedBatch):
+        return backend().feed.submit(request)
+
+    @router.get("/feed/receipts/{receipt_id}", response_model=FeedReceipt, dependencies=[Depends(feed_access)])
+    def feed_receipt(receipt_id: str):
+        return backend().feed.receipt(receipt_id)
+
+    @router.post("/feed/receipts/{receipt_id}/retry", response_model=FeedReceipt, dependencies=[Depends(feed_access)])
+    def retry_feed(receipt_id: str):
+        return backend().feed.retry(receipt_id)
+
+    @router.get("/updates", response_class=StreamingResponse)
+    async def updates(request: Request, after: Annotated[int | None, Query(ge=0)] = None,
+                      last_event_id: Annotated[str | None, Header()] = None):
+        if last_event_id is not None:
+            if not last_event_id.isascii() or not last_event_id.isdecimal() or len(last_event_id) > 19:
+                raise ServiceError(422, "invalid_event_cursor", "Last-Event-ID must be a nonnegative integer")
+            after = int(last_event_id)  # Browser reconnect cursor overrides an initial query cursor.
+        stream = backend().updates
+        cursor, initial = await asyncio.to_thread(stream.begin, after)
+        return StreamingResponse(stream.stream(request, cursor, initial), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
     @router.get("/meta")
     def meta():
         return backend().meta()
@@ -129,11 +166,11 @@ def install_v1(app, service):
     def state():
         return backend().state()
 
-    @router.get("/evidence", response_model=SavedEvidence)
+    @router.get("/evidence", response_model=SavedEvidence, response_model_exclude_unset=True)
     def evidence(query: Annotated[EvidenceRequest, Query()]):
         return backend().evidence(query)
 
-    @router.get("/comparisons", response_model=SavedComparison)
+    @router.get("/comparisons", response_model=SavedComparison, response_model_exclude_unset=True)
     def comparisons(query: Annotated[ComparisonRequest, Query()]):
         return backend().comparison(query)
 
@@ -149,11 +186,11 @@ def install_v1(app, service):
     def investigation(investigation_id: str, query: Annotated[ExpectedState, Query()]):
         return backend().investigation(investigation_id, query)
 
-    @router.get("/patients/{patient_id}/history", response_model=SavedHistory)
+    @router.get("/patients/{patient_id}/history", response_model=SavedHistory, response_model_exclude_unset=True)
     def history(patient_id: str, query: Annotated[HistoryRequest, Query()]):
         return backend().patient_history(patient_id, query)
 
-    @router.get("/analyses/{analysis_id}", response_model=SavedAnalysis)
+    @router.get("/analyses/{analysis_id}", response_model=SavedAnalysis, response_model_exclude_unset=True)
     def analysis(analysis_id: str):
         return backend().analysis(analysis_id)
 
@@ -163,7 +200,7 @@ def install_v1(app, service):
         headers = {"Content-Disposition": f'attachment; filename="analysis-{report.analysis_id}.{format}"'}
         if format == "csv":
             return Response(export_csv(report), media_type="text/csv", headers=headers)
-        return Response(report.model_dump_json(), media_type="application/json", headers=headers)
+        return Response(report.model_dump_json(exclude_unset=True), media_type="application/json", headers=headers)
 
     @router.post("/replay/reset", response_model=ReplayState)
     def reset(request: Annotated[ReplayReset | None, Body()] = None):

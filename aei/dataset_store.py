@@ -59,7 +59,7 @@ def _append_records(db, table, columns, key, rows):
     """Internal bulk writer: all identifiers are fixed by this module."""
     target, staging = sql.Identifier(table), sql.Identifier("incoming_" + table)
     fields = sql.SQL(", ").join(map(sql.Identifier, columns))
-    db.execute(sql.SQL("CREATE TEMP TABLE {} (LIKE {}) ON COMMIT DROP").format(staging, target))
+    db.execute(sql.SQL("CREATE TEMP TABLE {} (LIKE {} INCLUDING DEFAULTS) ON COMMIT DROP").format(staging, target))
     submitted = 0
     with db.cursor().copy(sql.SQL("COPY {} ({}) FROM STDIN").format(staging, fields)) as copy:
         for row in rows:
