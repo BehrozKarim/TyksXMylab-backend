@@ -29,6 +29,9 @@ It does not rewrite sample dates, inject UI values or need Flink.
 
 The launcher checks prerequisites and reports missing dependencies. It does not install
 packages, pull Git changes, change PowerShell policy globally or stop unrelated services.
+After pulling frontend changes, rerun `npm.cmd ci` if dependencies changed. The
+launcher checks every declared frontend package, including the bundled font packages,
+before starting services; a missing package is reported instead of opening a blank page.
 
 Source selection: explicit `-Source`, then `AEI_DATASET_PATH`, then the first existing
 location among `synthetic_microbiology_dataset/` inside the backend, the ZIP beside
