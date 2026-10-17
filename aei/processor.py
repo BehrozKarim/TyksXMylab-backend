@@ -1,10 +1,9 @@
 """Deterministic reference processor: no storage, clock, HTTP or Flink dependency."""
 
 from collections import defaultdict
-from datetime import timedelta
 from typing import Iterable, Protocol
 
-from .models import AnalysisQuery, AnalysisResult, IsolateEvent, Statistic
+from .models import AnalysisQuery, AnalysisResult, ComparisonResult, IsolateEvent, Statistic
 
 
 class Processor(Protocol):
@@ -13,7 +12,7 @@ class Processor(Protocol):
 
 class ReferenceProcessor:
     def calculate(self, events: Iterable[IsolateEvent], query: AnalysisQuery) -> AnalysisResult:
-        start = query.start_date or query.as_of - timedelta(days=query.window_days - 1)
+        start = query.period_start
 
         # Revisions are resolved BEFORE filtering sample dates or cohorts. A correction
         # can move an isolate out of a period; its old revision must not reappear.
@@ -78,5 +77,17 @@ class ReferenceProcessor:
                     resistance_percent=round(100 * resistant / tested, 2) if available else None,
                     status="available" if available else "insufficient_data",
                 ))
-        return AnalysisResult(start_date=start, end_date=query.as_of, query=query,
+        return AnalysisResult(period=query.period_name, start_date=start, end_date=query.as_of, query=query,
                               latest_received_at=latest_received, rows=tuple(rows))
+
+
+def compare_periods(processor: Processor, events: Iterable[IsolateEvent], query: AnalysisQuery) -> ComparisonResult:
+    if query.period is not None or query.start_date is not None or query.window_days is not None:
+        raise ValueError("Comparison uses fixed rolling 28-day and 12-month periods; omit period overrides")
+    # Both reports use the exact same source snapshot, but deduplicate independently.
+    snapshot = list(events)
+    common = query.model_dump(exclude={"period", "start_date", "window_days"})
+    return ComparisonResult(
+        rolling_28_days=processor.calculate(snapshot, AnalysisQuery(**common, period="rolling_28_days")),
+        rolling_12_months=processor.calculate(snapshot, AnalysisQuery(**common, period="rolling_12_months")),
+    )

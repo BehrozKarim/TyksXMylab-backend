@@ -1,26 +1,29 @@
 # Reserved Flink integration boundary
 
 There is intentionally no fake Flink job or placeholder running service here.
-The first milestone establishes event and output contracts, plus a tested
-reference result that the real Flink job must reproduce.
+The first milestones establish event and output contracts, a PostgreSQL source,
+and tested reference results that the real Flink job must reproduce.
 
 ## Stable contracts
 
 - Input: `aei.models.IsolateEvent`, schema version 1. Generate JSON Schema with
   `python -m aei schema`. Corrections are full snapshots with higher revisions.
-- Query/rules: `AnalysisQuery`; current output identifies `prototype-v1`.
+- Query/rules: `AnalysisQuery`; current output identifies `prototype-v2`. Annual
+  means rolling 12 calendar months; the other standard period is rolling 28 days.
 - Output: `AnalysisResult` and `Statistic`. Missing percentages stay null.
 - Oracle: `ReferenceProcessor.calculate(events, query)` is independent of HTTP
   and storage. It defines expected results for a specified date and knowledge cutoff.
-- Storage boundary: `EventStore` separates the local SQLite adapter from a future
-  append-only PostgreSQL event table.
+- Storage boundary: `EventStore` now defaults to `PostgresEventStore`. The source
+  table is `aei.isolate_events`, with unique event/revision identities and append-only
+  enforcement. SQLite is retained only for migration and unit tests.
 
 The future API will read materialized Flink outputs; it will not invoke a Flink job
 synchronously through the Python reference processor interface.
 
 ## Implementation sequence
 
-1. Add PostgreSQL storage implementing the same event identity/revision guarantees.
+1. PostgreSQL storage and Docker Compose are implemented. Logical WAL is enabled;
+   a replication user, publication and slot still need to be configured for Flink.
 2. Configure Flink CDC for the input table only; output tables must not feed back.
 3. Implement revision handling and keyed first-isolate state per configured scope.
    Retain later candidates: an isolate that is not first today can become first

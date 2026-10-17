@@ -1,110 +1,144 @@
-# Tyks AEI: reference pipeline before Flink
+# Tyks AEI backend
 
-This first development slice checks ingestion, event history and the calculation
-rules on the supplied synthetic data. It is a runnable backend, not a dashboard.
+Current flow: **CSV archive or API -> append-only PostgreSQL event history -> Python
+reference processor -> JSON statistics**. PostgreSQL runs in Docker with a persistent
+volume. Annual results now mean **rolling last 12 calendar months**, alongside the
+rolling last 28 days. Flink, alerts and a dashboard are not active yet.
 
-Current flow: **CSV archive or API → append-only SQLite event history → reference
-processor → JSON statistics**. SQLite makes this slice runnable without Docker.
-The planned architecture remains **PostgreSQL event history → Flink CDC/Flink →
-PostgreSQL results → API/dashboard**. SQLite is not a CDC or Flink implementation.
+## Start the database and backend
 
-## Run locally
-
-From this directory (`tyks-MY-LAB/aei-prototype`), using Python 3.11:
+Run from this repository root using Python 3.11 and Docker Desktop (Linux containers):
 
 ```powershell
-# Only needed if these packages are not already installed:
-python -m pip install -r requirements.txt
-
-# Import once. Running it again does not duplicate events.
-python -m aei import-dataset
-
-# The source ends on 2026-09-27; use an explicit reporting date.
-python -m aei stats --as-of 2026-09-27 --ward ED --organism "Escherichia coli" --specimen urine --antibiotic CIP
-
-# Interactive API documentation: http://127.0.0.1:8000/docs
-python -m uvicorn aei.api:create_app --factory --host 127.0.0.1 --port 8000
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+docker compose up -d --wait postgres
+.\.venv\Scripts\python.exe -m aei init-db
 ```
 
-API routes:
+The default development connection is
+`postgresql://aei:aei_local_only@127.0.0.1:55432/aei`. The port is bound to loopback.
+Override the backend connection with `AEI_DATABASE_URL`. Compose also accepts
+`POSTGRES_PASSWORD` and `POSTGRES_PORT` overrides; set a matching backend URL when
+changing them. A password environment change does not reset an existing volume's
+database password. Use these default credentials only for local development.
 
-- `GET /health`: implementation and event count.
+Data persists in the Compose project's named volume. `docker compose stop` stops
+the database without deleting its data. Logical WAL is enabled for future CDC;
+no Flink replication slot or job is created yet.
+
+## Load data or migrate SQLite history
+
+The supplied synthetic ZIP is not committed to Git. By default it is expected
+beside the project directory. Set `AEI_DATASET_PATH` or pass `--zip` if elsewhere.
+
+```powershell
+# Existing prototype users: preserve every recorded revision from SQLite.
+.\.venv\Scripts\python.exe -m aei migrate-sqlite --sqlite .data/aei.sqlite3
+
+# Fresh installations: import the supplied archive instead.
+.\.venv\Scripts\python.exe -m aei import-dataset --zip ../synthetic_microbiology_dataset.zip
+
+# API documentation: http://127.0.0.1:8000/docs
+.\.venv\Scripts\python.exe -m uvicorn aei.api:create_app --factory --host 127.0.0.1 --port 8000
+```
+
+Migration opens SQLite read-only and retains every event ID, revision and payload.
+Import/migration can be repeated safely: identical events are ignored; conflicts
+roll back the entire batch. SQLite is retained only for migration and isolated unit
+tests. The running backend uses PostgreSQL with no automatic SQLite fallback.
+
+## Reports and API
+
+```powershell
+.\.venv\Scripts\python.exe -m aei stats --as-of 2026-09-27 --period rolling_12_months --ward ED --organism "Escherichia coli" --specimen urine --antibiotic CIP
+.\.venv\Scripts\python.exe -m aei compare --as-of 2026-09-27 --ward ED --organism "Escherichia coli" --specimen urine --antibiotic CIP
+```
+
+- `GET /health`: storage backend, processor, event count.
 - `POST /events`: append one complete isolate revision.
-- `POST /events/batch`: append 1–500 revisions in one transaction.
-- `GET /isolates/{isolate_id}/history`: all recorded revisions.
-- `GET /statistics?as_of=2026-09-27`: recompute the requested period.
+- `POST /events/batch`: append 1-500 revisions in one transaction.
+- `GET /isolates/{isolate_id}/history`: every revision of that isolate.
+- `GET /statistics?as_of=2026-09-27`: latest 28 days by default.
+- `GET /statistics?as_of=2026-09-27&period=rolling_12_months`: latest 12 months.
+- `GET /statistics/comparison?as_of=2026-09-27`: both periods from one source snapshot.
 
-Statistics filters: `ward_code`, `organism`, `specimen`, `antibiotic_code`.
-`start_date` explicitly overrides the default 28-day start. `known_at` optionally
-restricts results to revisions received by that timestamp. `as_of` controls sample
-date inclusion, not knowledge time; without `known_at`, latest known revisions are
-used. Dates are inclusive. No implicit system date is used.
+Filters: `ward_code`, `organism`, `specimen`, `antibiotic_code`, `dedup_scope`.
+`known_at` optionally restricts results to revisions received by that timestamp.
+`as_of` controls sample dates, not knowledge time. Without `known_at`, the latest
+known revisions are used. No system date is selected implicitly.
 
-SQLite data is stored in `.data/aei.sqlite3`, ignored by Git. Override with global
-CLI `--db PATH` before the command, or `AEI_DB_PATH` for the API. Bind the API to
-localhost; authentication and production deployment are not part of this slice.
+### Rolling-year definition
 
-## Replay the moving window
+The 28-day period is `as_of - 27 days` through `as_of`, inclusive. The 12-month
+period starts the day **after the previous calendar-year anniversary** and ends
+on `as_of`, inclusive. It is not a fixed 365-day approximation.
 
-Use a new database path for each replay:
+| Report date | 28-day period | 12-month period |
+| --- | --- | --- |
+| 2026-09-27 | 2026-08-31 to 2026-09-27 | 2025-09-28 to 2026-09-27 |
+| 2024-03-01 | 2024-02-03 to 2024-03-01 | 2023-03-02 to 2024-03-01 (366 days) |
+
+February 29 uses February 28 as its anniversary in a non-leap year, so a report
+ending 2024-02-29 starts 2023-03-01. Each period selects first isolates independently;
+annual percentages are not sums or averages of monthly percentages.
+
+Custom `start_date` or `window_days` are supported on `/statistics` but cannot be
+combined with a named `period`. The comparison route always uses the two standard
+periods and rejects period overrides. Reports identify rules version `prototype-v2`.
+
+### Counting contract
+
+- Events are complete isolate snapshots, including the full antibiotic test panel.
+- Resolve the latest revision before filtering sample dates or cohorts.
+- Select the first isolate per patient, organism and specimen within each period.
+- Same-day ties use culture ID, then isolate ID; collection times are absent.
+- Default `dedup_scope=selected_cohort` filters by ward before selecting first isolates.
+  `all_wards` selects first across wards, then filters the selected ward. The final
+  ward-transfer policy remains to be confirmed with the challenge partners.
+- Select antibiotics after choosing first isolates. An untested first isolate is
+  not replaced by a later tested isolate; this policy also awaits confirmation.
+- Each output group is one ward/organism/specimen/antibiotic combination. Ward
+  reports cannot simply be added to produce hospital-wide percentages.
+- Denominator: selected isolates actually tested against that antibiotic.
+- Below 30 tested isolates, percentages are null and status is `insufficient_data`.
+  Counts remain visible. Empty cohorts return `rows: []`, not a zero-percent result.
+- Susceptibility = `100*S/(S+R)`; resistance = `100*R/(S+R)`, rounded to two decimals.
+
+The importer validates patient/culture/isolate/test links. Negative cultures with
+no isolates do not contribute to these percentages. The original ZIP is unchanged.
+The source lacks result-arrival timestamps; imported events use **12:00 UTC on the
+sample date as an explicit synthetic arrival convention**.
+
+## Replay
+
+Use a separate empty PostgreSQL schema to preserve the main event history:
 
 ```powershell
-python -m aei --db .data/replay.sqlite3 replay --from-date 2026-08-31 --through 2026-09-27 --delay 0.2
+.\.venv\Scripts\python.exe -m aei --schema aei_replay replay --from-date 2026-08-31 --through 2026-09-27 --delay 0.2
 ```
 
-The driver first loads events before the starting date, then advances one day at
-a time, adds that day's events and recalculates. It includes days with no events
-so expired samples leave the window. Output is a progress summary, not an alert.
-`--delay` sets wall-clock pacing only. The source supplies sample dates, not arrival
-timestamps: imported events use **12:00 UTC on the sample date as a synthetic
-arrival convention**. This does not simulate real laboratory turnaround times.
-
-## Implemented calculation contract
-
-- One event is a complete isolate revision, including its full antibiotic panel.
-- Resolve latest revisions before applying sample date/cohort filters.
-- Select the first isolate per patient, organism and specimen within each period.
-- Same-day ties use culture ID, then isolate ID (the source lacks collection times).
-- Default `dedup_scope=selected_cohort` applies ward filtering before selection.
-  `dedup_scope=all_wards` selects first across wards, then filters the selected ward.
-  This is an explicit prototype choice, not a settled clinical rule.
-- Apply antibiotic selection **after** choosing the first isolate. An untested
-  first isolate is not replaced by a later tested isolate.
-- Report each ward/organism/specimen/antibiotic group separately. Hospital-wide
-  percentages cannot be obtained by summing these deduplicated ward reports.
-- Denominator is the number of eligible isolates tested against that antibiotic.
-- Percentages are `null` below 30 tested isolates, including zero tested. Counts
-  remain visible. An empty cohort returns `rows: []`, not a zero-percent result.
-- Susceptibility = `100*S/(S+R)`; resistance = `100*R/(S+R)`, rounded to two decimals.
-- Input `event_id` and `(isolate_id, revision)` are unique. Identical deliveries
-  are ignored; conflicts return HTTP 409 and roll back the submitted batch.
-
-The importer validates links between patients, cultures, isolates and results.
-It imports isolate events only: negative cultures without isolates are not used
-in these susceptibility percentages. Original CSVs and ZIP remain unchanged.
-
-## Scope still pending
-
-AEI naming/formula approval, annual-period definition, ward-transfer policy,
-same-day tie handling, alert baseline/thresholds and real arrival behavior remain
-open. Explicit date ranges are supported, but no annual default is invented.
-
-Flink, PostgreSQL CDC, stored statistics/alert history, automated live notifications,
-alerts and the dashboard are **not implemented yet**. Event history is persisted;
-statistics are currently calculated on demand or by the replay driver. The
-reference processor reads the stored history each time and is for correctness
-validation, not a performance claim for a production stream.
+The driver loads earlier events, then advances daily, including days without new
+results, and prints recalculation summaries. It is a simulation, not a live lab
+feed. Use another empty replay schema when repeating the demonstration.
 
 ## Verify
 
 ```powershell
-python -m unittest discover -s tests -v
-python -m aei schema
+# Unit/API/reference tests; dataset test skips if the supplied ZIP is absent.
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+
+# Include real PostgreSQL integration tests in disposable aei_test_* schemas.
+$env:AEI_TEST_DATABASE_URL = 'postgresql://aei:aei_local_only@127.0.0.1:55432/aei'
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-Tests cover the 29/30 boundary, missing tests, repeated patients, period boundaries,
-first-isolate replacement as the window advances, corrections, historical knowledge
-cutoffs, ward-filter policy, retry safety, atomic conflicts, append-only storage,
-API validation and the actual supplied archive.
+Tests cover leap years, independent period selection, missing tests, the 29/30
+threshold, corrections, knowledge cutoffs, atomic conflicts, concurrent retries,
+append-only history, read-only SQLite migration, API behavior and the supplied data.
+`python -m aei schema` prints the versioned input contract.
 
-See [the Flink integration boundary](flink/README.md) for the next stage.
+Still pending: Flink processing, persisted result/alert history, alert definitions,
+live notifications and the dashboard. Statistics currently run on demand or during
+replay and load source history in memory; this is a correctness reference, not a
+production throughput claim. See [the Flink integration boundary](flink/README.md).

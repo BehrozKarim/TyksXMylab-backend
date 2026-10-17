@@ -8,9 +8,9 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from aei.api import create_app
-from aei.dataset import load_dataset
+from aei.dataset import DEFAULT_DATASET, load_dataset
 from aei.models import AnalysisQuery, IsolateEvent, Susceptibility
-from aei.processor import ReferenceProcessor
+from aei.processor import ReferenceProcessor, compare_periods
 from aei.store import EventConflict, SQLiteEventStore
 
 
@@ -123,6 +123,40 @@ class CalculationTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             event(tests=[event().tests[0], event().tests[0]])
 
+    def test_rolling_year_uses_calendar_anniversary(self):
+        result = self.calculate([], query(period="rolling_12_months"))
+        self.assertEqual((result.start_date, result.end_date), (date(2025, 9, 28), date(2026, 9, 27)))
+        self.assertEqual(result.period, "rolling_12_months")
+
+    def test_rolling_year_includes_leap_day(self):
+        request = AnalysisQuery(as_of=date(2024, 3, 1), period="rolling_12_months")
+        result = self.calculate([], request)
+        self.assertEqual(result.start_date, date(2023, 3, 2))
+        self.assertEqual((result.end_date - result.start_date).days + 1, 366)
+
+    def test_leap_day_anniversary_is_clamped(self):
+        request = AnalysisQuery(as_of=date(2024, 2, 29), period="rolling_12_months")
+        self.assertEqual(request.period_start, date(2023, 3, 1))
+
+    def test_rolling_year_boundary_is_exclusive_at_prior_anniversary(self):
+        events = [event("before", day="2025-09-27"), event("start", day="2025-09-28"),
+                  event("end", day="2026-09-27"), event("future", day="2026-09-28")]
+        self.assertEqual(self.calculate(events, query(period="rolling_12_months")).rows[0].tested, 2)
+
+    def test_comparison_deduplicates_the_two_periods_independently(self):
+        events = [event("old", patient="p", day="2026-01-01", result="R"), event("new", patient="p")]
+        result = compare_periods(self.processor, iter(events), query())
+        self.assertEqual(result.rolling_28_days.rows[0].susceptible, 1)
+        self.assertEqual(result.rolling_12_months.rows[0].resistant, 1)
+
+    def test_named_and_custom_periods_cannot_be_mixed(self):
+        with self.assertRaises(ValidationError):
+            query(period="rolling_12_months", start_date=date(2026, 1, 1))
+        with self.assertRaises(ValidationError):
+            query(period="rolling_12_months", window_days=365)
+        with self.assertRaises(ValueError):
+            compare_periods(self.processor, [], query(period="rolling_12_months"))
+
 
 class StoreAndAPITests(unittest.TestCase):
     def setUp(self):
@@ -155,7 +189,7 @@ class StoreAndAPITests(unittest.TestCase):
         self.assertEqual(self.store.count(), 1)
 
     def test_api_ingestion_statistics_and_history(self):
-        with TestClient(create_app(self.path)) as client:
+        with TestClient(create_app(store=self.store)) as client:
             batch = [event(str(i), result="S" if i < 24 else "R").model_dump(mode="json") for i in range(30)]
             response = client.post("/events/batch", json=batch)
             self.assertEqual(response.status_code, 200, response.text)
@@ -169,14 +203,20 @@ class StoreAndAPITests(unittest.TestCase):
             self.assertEqual(client.get("/statistics", params={"as_of": "2026-09-27", "start_date": "2026-10-01"}).status_code, 422)
             self.assertEqual(client.get("/isolates/missing/history").status_code, 404)
             self.assertEqual(client.post("/events", json={"invalid": True}).status_code, 422)
+            response = client.get("/statistics/comparison", params={"as_of": "2026-09-27"})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["rolling_12_months"]["start_date"], "2025-09-28")
+            self.assertEqual(client.get("/statistics/comparison", params={
+                "as_of": "2026-09-27", "window_days": 365}).status_code, 422)
 
     def test_api_returns_conflict_for_a_changed_existing_event(self):
-        with TestClient(create_app(self.path)) as client:
+        with TestClient(create_app(store=self.store)) as client:
             client.post("/events", json=event().model_dump(mode="json"))
             self.assertEqual(client.post("/events", json=event(result="R").model_dump(mode="json")).status_code, 409)
 
 
 class SuppliedDatasetTests(unittest.TestCase):
+    @unittest.skipUnless(DEFAULT_DATASET.is_file(), "Set AEI_DATASET_PATH to the supplied synthetic ZIP")
     def test_supplied_archive_loads_into_complete_events(self):
         events = load_dataset()
         self.assertEqual(len(events), 24571)

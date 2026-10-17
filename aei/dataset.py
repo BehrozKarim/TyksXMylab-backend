@@ -2,6 +2,7 @@
 
 import csv
 import io
+import os
 from collections import defaultdict
 from datetime import date, datetime, time, timezone
 from pathlib import Path
@@ -10,7 +11,8 @@ from zipfile import ZipFile
 from .models import IsolateEvent, Susceptibility
 
 
-DEFAULT_DATASET = Path(__file__).resolve().parents[2] / "synthetic_microbiology_dataset.zip"
+DEFAULT_DATASET = Path(os.environ.get("AEI_DATASET_PATH",
+    str(Path(__file__).resolve().parents[2] / "synthetic_microbiology_dataset.zip")))
 
 
 def load_dataset(path: str | Path = DEFAULT_DATASET) -> list[IsolateEvent]:
