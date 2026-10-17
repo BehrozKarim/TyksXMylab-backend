@@ -2,3 +2,4 @@
 __pycache__/
 *.pyc
 .venv/
+synthetic_microbiology_dataset/
