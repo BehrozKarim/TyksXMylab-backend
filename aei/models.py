@@ -1,4 +1,4 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
@@ -49,8 +49,9 @@ class IsolateEvent(StrictModel):
 
 class AnalysisQuery(StrictModel):
     as_of: date
+    period: Literal["rolling_28_days", "rolling_12_months"] | None = None
     start_date: date | None = None
-    window_days: int = Field(default=28, ge=1, le=3660)
+    window_days: int | None = Field(default=None, ge=1, le=3660)
     known_at: AwareDatetime | None = None
     ward_code: str | None = None
     organism: str | None = None
@@ -60,11 +61,37 @@ class AnalysisQuery(StrictModel):
 
     @model_validator(mode="after")
     def valid_period(self):
+        if self.period is not None and (self.start_date is not None or self.window_days is not None):
+            raise ValueError("Use a named period OR custom start_date/window_days, not both")
+        if self.start_date is not None and self.window_days is not None:
+            raise ValueError("Use start_date OR window_days, not both")
         if self.start_date is not None and self.start_date > self.as_of:
             raise ValueError("start_date cannot be later than as_of")
-        if self.start_date is None and (self.as_of - date.min).days < self.window_days - 1:
+        if self.period == "rolling_12_months" and self.as_of.year == 1:
+            raise ValueError("A rolling year requires a preceding calendar year")
+        if (self.period != "rolling_12_months" and self.start_date is None
+                and (self.as_of - date.min).days < (self.window_days or 28) - 1):
             raise ValueError("window_days extends before the supported date range")
         return self
+
+    @property
+    def period_name(self) -> str:
+        if self.start_date is not None or self.window_days is not None:
+            return "custom"
+        return self.period or "rolling_28_days"
+
+    @property
+    def period_start(self) -> date:
+        if self.start_date is not None:
+            return self.start_date
+        if self.period == "rolling_12_months":
+            try:
+                anniversary = self.as_of.replace(year=self.as_of.year - 1)
+            except ValueError:
+                # A leap-day anniversary in a non-leap year is February 28.
+                anniversary = self.as_of.replace(year=self.as_of.year - 1, day=28)
+            return anniversary + timedelta(days=1)
+        return self.as_of - timedelta(days=(self.window_days or 28) - 1)
 
 
 class Statistic(StrictModel):
@@ -83,10 +110,16 @@ class Statistic(StrictModel):
 
 
 class AnalysisResult(StrictModel):
-    rules_version: Literal["prototype-v1"] = "prototype-v1"
+    rules_version: Literal["prototype-v2"] = "prototype-v2"
     minimum_tested: Literal[30] = 30
+    period: Literal["rolling_28_days", "rolling_12_months", "custom"]
     start_date: date
     end_date: date
     query: AnalysisQuery
     latest_received_at: datetime | None
     rows: tuple[Statistic, ...]
+
+
+class ComparisonResult(StrictModel):
+    rolling_28_days: AnalysisResult
+    rolling_12_months: AnalysisResult

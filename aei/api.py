@@ -4,8 +4,8 @@ from typing import Annotated
 
 from fastapi import Body, FastAPI, HTTPException, Query
 
-from .models import AnalysisQuery, AnalysisResult, IsolateEvent
-from .processor import Processor, ReferenceProcessor
+from .models import AnalysisQuery, AnalysisResult, ComparisonResult, IsolateEvent
+from .processor import Processor, ReferenceProcessor, compare_periods
 from .store import EventConflict, SQLiteEventStore
 
 
@@ -17,7 +17,7 @@ def create_app(db_path: str | Path | None = None, processor: Processor | None = 
     calculation = processor or ReferenceProcessor()
     app = FastAPI(
         title="Tyks AEI reference pipeline",
-        version="0.1.0",
+        version="0.2.0",
         description=("Local validation prototype. Explicit analysis dates, append-only isolate history, "
                      "and reference calculations. Flink, alerts and a dashboard are not active yet."),
     )
@@ -25,7 +25,7 @@ def create_app(db_path: str | Path | None = None, processor: Processor | None = 
     @app.get("/health")
     def health():
         return {"status": "ok", "storage": "sqlite", "processor": "reference",
-                "events": store.count(), "rules_version": "prototype-v1"}
+                "events": store.count(), "rules_version": "prototype-v2"}
 
     def append(events):
         try:
@@ -52,5 +52,12 @@ def create_app(db_path: str | Path | None = None, processor: Processor | None = 
     @app.get("/statistics", response_model=AnalysisResult)
     def statistics(query: Annotated[AnalysisQuery, Query()]):
         return calculation.calculate(store.events(), query)
+
+    @app.get("/statistics/comparison", response_model=ComparisonResult)
+    def comparison(query: Annotated[AnalysisQuery, Query()]):
+        try:
+            return compare_periods(calculation, store.events(), query)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
 
     return app

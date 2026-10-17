@@ -32,10 +32,13 @@ API routes:
 - `POST /events`: append one complete isolate revision.
 - `POST /events/batch`: append 1–500 revisions in one transaction.
 - `GET /isolates/{isolate_id}/history`: all recorded revisions.
-- `GET /statistics?as_of=2026-09-27`: recompute the requested period.
+- `GET /statistics?as_of=2026-09-27`: rolling 28 days by default.
+- `GET /statistics?as_of=2026-09-27&period=rolling_12_months`: rolling 12 months.
+- `GET /statistics/comparison?as_of=2026-09-27`: both periods from one source snapshot.
 
 Statistics filters: `ward_code`, `organism`, `specimen`, `antibiotic_code`.
-`start_date` explicitly overrides the default 28-day start. `known_at` optionally
+`start_date` or `window_days` can override the default 28-day start. These custom
+overrides cannot be combined with a named `period`. `known_at` optionally
 restricts results to revisions received by that timestamp. `as_of` controls sample
 date inclusion, not knowledge time; without `known_at`, latest known revisions are
 used. Dates are inclusive. No implicit system date is used.
@@ -43,6 +46,30 @@ used. Dates are inclusive. No implicit system date is used.
 SQLite data is stored in `.data/aei.sqlite3`, ignored by Git. Override with global
 CLI `--db PATH` before the command, or `AEI_DB_PATH` for the API. Bind the API to
 localhost; authentication and production deployment are not part of this slice.
+
+## Rolling annual reporting
+
+The 28-day period is `as_of - 27 days` through `as_of`, inclusive. The 12-month
+period starts the day **after the previous calendar-year anniversary** and ends
+on `as_of`, inclusive. It is not a fixed 365-day approximation.
+
+| Report date | 28-day period | 12-month period |
+| --- | --- | --- |
+| 2026-09-27 | 2026-08-31 to 2026-09-27 | 2025-09-28 to 2026-09-27 |
+| 2024-03-01 | 2024-02-03 to 2024-03-01 | 2023-03-02 to 2024-03-01 (366 days) |
+
+February 29 uses February 28 as its anniversary in a non-leap year, so a report
+ending 2024-02-29 starts 2023-03-01. Each period selects first isolates independently;
+annual percentages are not sums or averages of monthly percentages.
+
+Custom `start_date` or `window_days` are supported on `/statistics` but cannot be
+combined with a named `period`. The comparison route always uses the two standard
+periods and rejects period overrides. Reports identify rules version `prototype-v2`.
+
+```powershell
+python -m aei stats --as-of 2026-09-27 --period rolling_12_months
+python -m aei compare --as-of 2026-09-27
+```
 
 ## Replay the moving window
 
@@ -85,9 +112,9 @@ in these susceptibility percentages. Original CSVs and ZIP remain unchanged.
 
 ## Scope still pending
 
-AEI naming/formula approval, annual-period definition, ward-transfer policy,
-same-day tie handling, alert baseline/thresholds and real arrival behavior remain
-open. Explicit date ranges are supported, but no annual default is invented.
+AEI naming/formula approval, ward-transfer policy, same-day tie handling, alert
+baseline/thresholds and real arrival behavior remain open. Annual reporting uses
+the confirmed rolling last 12 calendar months.
 
 Flink, PostgreSQL CDC, stored statistics/alert history, automated live notifications,
 alerts and the dashboard are **not implemented yet**. Event history is persisted;

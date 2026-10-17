@@ -8,7 +8,8 @@ reference result that the real Flink job must reproduce.
 
 - Input: `aei.models.IsolateEvent`, schema version 1. Generate JSON Schema with
   `python -m aei schema`. Corrections are full snapshots with higher revisions.
-- Query/rules: `AnalysisQuery`; current output identifies `prototype-v1`.
+- Query/rules: `AnalysisQuery`; current output identifies `prototype-v2`. Annual
+  means rolling 12 calendar months; the other standard period is rolling 28 days.
 - Output: `AnalysisResult` and `Statistic`. Missing percentages stay null.
 - Oracle: `ReferenceProcessor.calculate(events, query)` is independent of HTTP
   and storage. It defines expected results for a specified date and knowledge cutoff.
