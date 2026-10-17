@@ -2,6 +2,38 @@
 
 Status: implementation plan for extending the runnable reference prototype at commit `b54015f` (`Move prototype contents to repository root`). Existing capabilities below describe inspected code; the `/api/v1` contract describes planned additions that the frontend must follow.
 
+Development update: the current backend uses Docker PostgreSQL and `prototype-v2`
+with rolling 28-day and rolling 12-month reports. The first importer/storage upgrade
+now supports validated ZIP/CSV-folder imports, source manifests, complete cultures
+and revision-bound enrichment in one PostgreSQL transaction. The next calculation
+upgrade adds `/api/v1/evidence` and CLI `evidence`: both agreed windows, age/sex filters,
+combined all-wards evidence, richer statuses, Wilson intervals and source coverage.
+Its `evidence-v1` method keeps the existing ward-policy default and date boundaries;
+it does not adopt the proposed calendar-year window or global-before-ward default.
+See [README](README.md) for the implemented contract and current limitations.
+The SQLite, missing-ZIP and `prototype-v1` references below describe the original
+planning baseline.
+
+The existing-component API/replay upgrade now also implements `/api/v1/meta`, `/state`,
+published `/evidence`, saved analysis retrieval/JSON/CSV export and replay
+`start`/`pause`/`step`/`reset`, with uniform versioned errors and configurable CORS.
+PostgreSQL source staging is separate from exact run membership; publication, clock
+and revision commit atomically. Frozen reports retain run/revision and file hashes.
+The first use exposes imported complete bundles at their latest date; reset seeds an
+earlier paused run. CLI evidence and replay use this same service. Legacy event writes
+remain stored history and do not automatically enter published replay evidence.
+This adapts B3, the replay lifecycle and export work to the agreed two periods and
+Docker PostgreSQL. The next upgrade now implements `/api/v1/comparisons` (`comparison-v1`),
+bounded `/patients` ID search and `/patients/{id}/history` (`history-v1`). Paired
+comparisons use the existing cohort policy and require 30 common tested isolates;
+history retains every prior published specimen with revision-bound pagination.
+Both report types are frozen and exportable. The history range is the prior calendar
+anniversary inclusive through the selected cutoff exclusive, as specified below.
+Alerts/investigation, external bundle publication, dashboard/live notifications and
+Flink remain later work.
+The original proposals below are retained for review; README and OpenAPI describe the
+implemented route names, response shapes and deliberate differences.
+
 Build a ward antibiotic evidence assistant that updates as synthetic laboratory records arrive. Its main outputs are susceptibility evidence across calendar annual, rolling 12-month and 28-day windows, an A/B laboratory comparison, specimen history, and automatically detected changes that a researcher can investigate.
 
 ## 1. Current repository and delivery boundary

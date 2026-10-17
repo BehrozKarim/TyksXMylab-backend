@@ -1,7 +1,9 @@
 # Tyks AEI backend
 
-Current flow: **CSV archive or API -> append-only PostgreSQL event history -> Python
-reference processor -> JSON statistics**. PostgreSQL runs in Docker with a persistent
+Current flow: **CSV archive/folder -> validated source bundles in PostgreSQL -> published
+replay run -> Python reference processor -> saved evidence and JSON/CSV exports**.
+The original event-ingestion and statistics endpoints also remain available.
+PostgreSQL runs in Docker with a persistent
 volume. Annual results now mean **rolling last 12 calendar months**, alongside the
 rolling last 28 days. Flink, alerts and a dashboard are not active yet.
 
@@ -29,15 +31,24 @@ no Flink replication slot or job is created yet.
 
 ## Load data or migrate SQLite history
 
-The supplied synthetic ZIP is not committed to Git. By default it is expected
-beside the project directory. Set `AEI_DATASET_PATH` or pass `--zip` if elsewhere.
+The supplied data is not committed to Git. Explicit `--zip` or `--dataset-dir`
+selects the source. Otherwise `AEI_DATASET_PATH` takes precedence, followed by
+the ZIP beside this project, then `synthetic_microbiology_dataset/` in this project.
+An explicit missing source fails rather than silently selecting another dataset.
 
 ```powershell
 # Existing prototype users: preserve every recorded revision from SQLite.
 .\.venv\Scripts\python.exe -m aei migrate-sqlite --sqlite .data/aei.sqlite3
 
-# Fresh installations: import the supplied archive instead.
-.\.venv\Scripts\python.exe -m aei import-dataset --zip ../synthetic_microbiology_dataset.zip
+# Validate all six CSV files without connecting to PostgreSQL.
+.\.venv\Scripts\python.exe -m aei validate-dataset --zip ../synthetic_microbiology_dataset.zip --report .data/validation.json
+
+# Import cultures, metadata and isolate events in one transaction.
+# Also works after a previous isolate-only import: existing events are preserved.
+.\.venv\Scripts\python.exe -m aei import-dataset --zip ../synthetic_microbiology_dataset.zip --report .data/import.json
+
+# Alternative source: a directory containing the same six CSV files.
+.\.venv\Scripts\python.exe -m aei validate-dataset --dataset-dir synthetic_microbiology_dataset
 
 # API documentation: http://127.0.0.1:8000/docs
 .\.venv\Scripts\python.exe -m uvicorn aei.api:create_app --factory --host 127.0.0.1 --port 8000
@@ -47,6 +58,51 @@ Migration opens SQLite read-only and retains every event ID, revision and payloa
 Import/migration can be repeated safely: identical events are ignored; conflicts
 roll back the entire batch. SQLite is retained only for migration and isolated unit
 tests. The running backend uses PostgreSQL with no automatic SQLite fallback.
+
+### Source validation and additional storage
+
+Both sources require `patients.csv`, `wards.csv`, `antibiotics.csv`, `cultures.csv`,
+`isolates.csv` and `susceptibility.csv`, with the supplied headers and comma-delimited
+UTF-8 (optional BOM). Dates accept only `YYYY-MM-DD` or `DD-MM-YY`; short years mean
+2000-2099. IDs remain strings, including leading zeros. Source files are never rewritten.
+
+Validation rejects duplicate IDs/AST pairs, missing links, dictionary mismatches,
+invalid values, contradictory culture/isolate counts, incorrect ISO weeks and
+admissions after sampling. Errors identify code, file, CSV line and record ID;
+the report retains the first 100 errors and the total error count. Validation
+failures exit with status 2 before opening a database connection. Missing AST is
+allowed and reported; no antibiotic outcome is inferred from a phenotype.
+
+Each manifest records source-file SHA-256 hashes, row counts, observed culture-date
+bounds, observed organism/specimen/drug panels and importer version. Warnings identify
+the synthetic receipt-time convention and the supplied README's omitted-pair discrepancy.
+Observed date bounds describe file contents, not proof of a complete live laboratory feed.
+
+PostgreSQL adds these immutable tables alongside the unchanged isolate event payloads:
+
+| Table | Stored information |
+| --- | --- |
+| `dataset_manifests` | Source identity, validation provenance and first import timestamp. |
+| `patients` | Sex, birth year and home area. |
+| `wards`, `antibiotics` | Source dictionaries, including drug screening labels. |
+| `culture_events` | Every culture, including negative/mixed cultures with no isolates. |
+| `isolate_enrichments` | Demographics, age at sampling, admission date, quantity and phenotype flags attached to the exact isolate event revision. |
+
+All source records, cultures, isolate events and enrichments commit together. Conflicts
+or a failure in any part roll back the complete import. Repeated imports of identical
+files are safe, including a ZIP and directory containing identical bytes. One manifest
+is allowed per PostgreSQL schema: a changed source or separate scenario requires a
+separate `--schema`. Equivalent CSVs re-encoded with different dates have different
+source hashes and therefore also require a separate schema. An external corrected
+isolate revision receives no metadata from an older revision automatically.
+
+`import-dataset --through YYYY-MM-DD` imports complete cultures and their isolates
+through that inclusive date. Repeating the same source with a later cutoff extends
+the import. Dictionaries/patients and the manifest describe the whole source, while
+the returned per-table counts describe the selected import. Source staging and replay
+visibility are separate: a later import does not silently change an existing run.
+Complete the import, then reset replay to publish a new view. Patient-history and
+comparison APIs read only the records published in that view.
 
 ## Reports and API
 
@@ -62,11 +118,213 @@ tests. The running backend uses PostgreSQL with no automatic SQLite fallback.
 - `GET /statistics?as_of=2026-09-27`: latest 28 days by default.
 - `GET /statistics?as_of=2026-09-27&period=rolling_12_months`: latest 12 months.
 - `GET /statistics/comparison?as_of=2026-09-27`: both periods from one source snapshot.
+- `GET /api/v1/evidence`: enriched evidence for one organism, specimen and antibiotic,
+  with both periods, demographic filters, confidence intervals and source coverage;
+  returns a saved `analysis_id` and its run/revision.
+- `GET /api/v1/meta`: filter dictionaries, observed panels, screening labels, supported
+  periods, source bounds, defaults and limitations.
+- `GET /api/v1/state`: active run, revision, demo date and published culture/isolate counts.
+- `GET /api/v1/comparisons`: paired susceptibility of two antibiotics in one selected period.
+- `GET /api/v1/patients?search=`: bounded ID search over patients with visible specimens.
+- `GET /api/v1/patients/{patient_id}/history`: paginated prior specimen/AST history.
+- `GET /api/v1/analyses/{analysis_id}`: retrieve the original saved response.
+- `GET /api/v1/analyses/{analysis_id}/export?format=json|csv`: download that response.
+- `POST /api/v1/replay/reset|start|pause|step`: control the synthetic replay.
 
 Filters: `ward_code`, `organism`, `specimen`, `antibiotic_code`, `dedup_scope`.
 `known_at` optionally restricts results to revisions received by that timestamp.
 `as_of` controls sample dates, not knowledge time. Without `known_at`, the latest
-known revisions are used. No system date is selected implicitly.
+known revisions are used. Legacy statistics require an explicit `as_of`; published
+evidence defaults to the run's demo date. Neither uses the computer's date implicitly.
+
+### Enriched evidence
+
+Run `import-dataset` first to populate the dictionaries, manifest and revision-bound
+metadata. Existing `/statistics` responses and `prototype-v2` rounding/status rules
+remain unchanged. The additive evidence contract identifies itself as `evidence-v1`.
+
+```powershell
+.\.venv\Scripts\python.exe -m aei evidence --as-of 2026-09-27 --ward ED --organism "Escherichia coli" --specimen urine --antibiotic CIP --sex F --age-min 65
+```
+
+Equivalent HTTP request:
+
+```text
+GET /api/v1/evidence?as_of=2026-09-27&ward_code=ED&organism=Escherichia%20coli&specimen=urine&antibiotic_code=CIP&sex=F&age_min=65
+```
+
+Required inputs are `organism`, `specimen` and `antibiotic_code`. Optional
+filters are `ward_code`, `sex`, inclusive `age_min`/`age_max`, `dedup_scope`, and
+`known_at`. Optional `as_of` defaults to the published demo date and cannot exceed it.
+Unknown codes, missing required inputs, invalid dates and inverted age
+ranges return HTTP 422. A missing validated dataset/unsupported store returns 503.
+On first use, a completed run exposes the complete culture bundles already imported,
+through their latest sample date. Use reset to start a replay from an earlier cutoff.
+
+Each response returns `analysis_id`, `context` and `windows.rolling_28_days` / `rolling_12_months`:
+
+- Revision resolution and first-isolate selection are shared with the existing
+  reference processor. Each period selects independently. The default ward policy
+  remains `selected_cohort`; `all_wards` remains an explicit alternative.
+- Omitting the ward returns one combined all-wards cohort. It reselects first
+  isolates across wards; it does not add ward-specific denominators or percentages.
+- Age/sex filters apply **after** first-isolate selection. A later matching isolate
+  never replaces an earlier nonmatching or unknown one. Age comes from the selected
+  specimen's recorded age, not an estimate from birth year.
+- Metadata is joined by exact event ID. New corrections without enrichment remain
+  unknown; old-revision metadata is never reused. Without demographic filters those
+  isolates remain eligible. With a requested demographic filter, unknown records
+  are excluded and counted in `metadata.excluded_unknown`.
+- `metadata` also reports the retained count before demographic filtering, unknown
+  sex/age counts, and known nonmatching exclusions. Unknown counts describe the
+  population before demographic filtering and are not extra eligible isolates.
+
+| Status | Meaning |
+| --- | --- |
+| `not_applicable` | The dictionary explicitly restricts the drug to another specimen. |
+| `empty_cohort` | No eligible isolates after selection/filtering; inspect metadata exclusions too. |
+| `no_tests` | Eligible isolates exist, but none was tested against this drug. |
+| `insufficient_data` | Between 1 and 29 eligible tested isolates. |
+| `available` | At least 30 eligible tested isolates. |
+
+Only `available` exposes percentages and two-sided 95% Wilson score intervals.
+All other states retain counts and return null percentages and interval endpoints.
+Evidence values use 0-100 units and retain calculation precision for display rounding.
+The [Wilson formula](https://itl.nist.gov/div898/handbook/prc/section2/prc241.htm)
+describes uncertainty in the observed laboratory proportion, not treatment success.
+Screening drugs are labeled through `context.antibiotic_is_screening`.
+
+Coverage separates the source's observed date span from how much has been imported:
+
+- `source_date_span_covers_window` tests the requested bounds against the manifest's
+  observed source dates. `overlap_start`/`overlap_end` are null for disjoint periods.
+- `source_fully_imported` compares imported culture/enrichment counts to the full
+  manifest, so `--through` cannot silently claim a complete source import.
+- Actual imported culture bounds and expected/imported counts are returned separately.
+  These flags describe source files and database contents, not proof of real feed
+  completeness. They remain independent of the 30-isolate threshold and `known_at`.
+
+Published evidence separates physical source coverage from run visibility:
+`context.published_cultures`, `published_isolates`, `demo_date` and
+`latest_visible_sample_date` describe the visible run. A fully staged source can
+still have most records hidden during replay. Counts in `coverage` describe the
+physical import at analysis creation, not a claim that future samples were included.
+
+Both windows are calculated under the same PostgreSQL publication/import lock and
+saved before that lock is released. Reports contain the exact run/revision, normalized
+filters, method/importer versions and source-file SHA-256 hashes. Repeating the same
+query at the same run/revision reuses its saved report; omitted defaults and equivalent
+knowledge-time offsets normalize identically. Steps (including empty days), start and
+pause change the revision; reset creates a new run. Old reports and exports never change.
+No source patient identifiers appear in aggregate exports.
+
+JSON exports contain the saved document. Evidence CSV exports contain two rows, one per period,
+with flattened dotted field names for context, filters, provenance, coverage and interval
+bounds. Suppressed percentages/intervals are empty; counts and status are retained.
+Spreadsheet formula prefixes in source labels are escaped with a leading apostrophe.
+
+For coordinated reads, send `expected_run_id` and `expected_revision` together, using
+`/api/v1/state`. Evidence, comparison, patient search and history accept them as query parameters; replay controls accept them
+in the JSON body. A mismatch returns HTTP 409 with `error.details.state` and creates
+no analysis. Omitting both uses whichever state is current when the request acquires
+the lock. Clients may poll state every two seconds; push notifications are not implemented.
+
+Versioned errors consistently use
+`{"error":{"code":"...","message":"...","details":{}},"request_id":"..."}`,
+with the same ID in `X-Request-ID`. Legacy routes retain their original error shapes.
+Set `AEI_CORS_ORIGINS` to a comma-separated list of allowed frontend origins; defaults
+are `http://localhost:3000` and `http://127.0.0.1:3000`.
+
+### Antibiotic comparison
+
+```text
+GET /api/v1/comparisons?organism=Escherichia%20coli&specimen=urine&antibiotic_a=CIP&antibiotic_b=TMP&ward_code=ED&window=rolling_12_months&as_of=2026-09-27
+```
+
+Require one organism/specimen and two different antibiotic codes. `window` accepts
+`rolling_28_days` (default) or `rolling_12_months`. Other cohort filters match evidence:
+ward, sex, inclusive age bounds, `known_at` and the existing `selected_cohort` default
+deduplication scope. The CLI `compare` and `/statistics/comparison` still compare
+reporting periods; `/api/v1/comparisons` compares antibiotics.
+
+The `comparison-v1` method shares evidence's revision resolution, first-isolate and
+demographic selection. It then keeps only retained isolates tested for **both** drugs.
+A later tested isolate never replaces an untested first isolate. Results include:
+
+- `n_eligible`, each drug's marginal `n_tested_a`/`n_tested_b`, and common `n_paired`.
+- `n_missing_a`, `n_missing_b` and `n_missing_either`. Isolates missing both appear in
+  each individual missing count, but only once in `n_missing_either`.
+- Four cells: `both_s`, `a_only_s` (A=S/B=R), `b_only_s` (A=R/B=S), and `both_r`.
+  Their sum is `n_paired`; `n_paired + n_missing_either = n_eligible`.
+
+On the common denominator N, the five measures are:
+
+| Field | Calculation |
+| --- | --- |
+| `a_susceptibility_pct` | `100 * (both_s + a_only_s) / N` |
+| `b_susceptibility_pct` | `100 * (both_s + b_only_s) / N` |
+| `net_difference_pp` | `100 * (b_only_s - a_only_s) / N` (B minus A, percentage points) |
+| `b_only_added_pct` | `100 * b_only_s / N` |
+| `at_least_one_s_pct` | `100 * (N - both_r) / N` |
+
+Status precedence is `not_applicable` for a dictionary specimen conflict,
+`empty_cohort`, `no_paired_tests`, `insufficient_data` for 1-29 pairs, then `available`.
+All five measures are null unless status is `available`, even if both marginal drug
+counts reach 30. Counts, demographic completeness and source coverage stay visible.
+Same-drug, unknown-drug and screening-drug comparisons return 422. FOX remains
+available as labeled single-drug evidence; `/meta.comparison_antibiotics` excludes screens.
+These are laboratory observations, with no drug ranking, synergy or treatment-efficacy claim.
+
+Comparison responses carry a saved `analysis_id` and full source/run/filter context.
+JSON export preserves the response; CSV has one `paired_comparison` row, including
+all cells, denominators, missing counts, suppressed values and provenance.
+
+### Patient specimen history
+
+```text
+GET /api/v1/patients?search=000&as_of=2026-09-27&limit=20
+GET /api/v1/patients/{patient_id}/history?as_of=2026-09-27&limit=25
+```
+
+Replace `{patient_id}` with an ID returned by search. Search uses a literal,
+case-sensitive substring (1-100 characters); `%` and `_` are not wildcards. It returns
+at most `limit` IDs (default 20, maximum 100), ordered by ID, with visible culture
+counts, latest collected dates, `has_more`, and the run/revision. Narrow the search
+when `has_more` is true. Eligibility requires any published specimen collected on or
+before `as_of`; it is independent of the history lookback and includes negative specimens.
+Search is a lookup response, not a saved analysis.
+
+The `history-v1` view returns **specimens collected before the selected date**, in
+`[prior calendar-year anniversary, as_of)`. For cutoff 2026-09-27, it includes
+2025-09-27 through 2026-09-26. February 29 clamps to February 28 in the previous year.
+Unlike the inclusive surveillance periods, the cutoff date itself is excluded.
+Both search/history default to the demo date and reject future `as_of` values.
+
+History includes every earlier published culture, negative/mixed cultures, repeated
+isolates, all species/wards and each isolate's complete recorded AST panel. It applies
+no surveillance first-isolate, drug, ward, species, sex or age filter. Unsupported
+cohort filters are rejected. Latest visible culture/isolate revisions are resolved
+before patient/date filtering; matching enrichment is attached only by exact event ID.
+Collection dates do not establish when clinicians received results. This view shows
+individual S/R test results without calculating a patient-level susceptibility percentage.
+
+A current-date-only patient, or one whose specimens are all older than the lookback,
+returns 200 with an empty prior-history list. Unknown and future-only patients receive
+the same 404 error. IDs from staged future data do not appear in search.
+
+History pages use `limit` (default 25, maximum 100) and sort by collection date, then
+culture ID, both descending. Each page is a saved analysis with source/run context.
+When `has_more` is true, pass `next_cursor` as the next request's `cursor`, retaining
+the patient, cutoff and limit. The opaque cursor references a saved page and is bound
+to its run, revision and filters. A replay step/reset/control change returns 409 for
+an old cursor; restart pagination from the first page. Malformed or mismatched cursors
+return 422. Existing saved pages remain downloadable across replay changes.
+
+History JSON exports preserve the page exactly. CSV repeats context and page metadata
+on `culture`, `isolate` and `ast` rows, retaining zero-isolate cultures and isolates
+without AST. An empty page produces a `history_summary` row. A history export contains
+the selected patient's identifiers and recorded laboratory data, unlike aggregate
+evidence/comparison exports. Export additional pages separately when history spans pages.
 
 ### Rolling-year definition
 
@@ -112,20 +370,62 @@ sample date as an explicit synthetic arrival convention**.
 
 ## Replay
 
-Use a separate empty PostgreSQL schema to preserve the main event history:
+Use a separate PostgreSQL schema to keep demo state independent of the main run:
 
 ```powershell
 .\.venv\Scripts\python.exe -m aei --schema aei_replay replay --from-date 2026-08-31 --through 2026-09-27 --delay 0.2
 ```
 
-The driver loads earlier events, then advances daily, including days without new
-results, and prints recalculation summaries. It is a simulation, not a live lab
-feed. Use another empty replay schema when repeating the demonstration.
+The driver validates and stages the complete source, creates a new run seeded through
+the day before `--from-date`, then publishes complete daily bundles. It prints state,
+new-culture and new-isolate counts. Negative/mixed cultures and days without arrivals
+still advance the clock. It accepts `--dataset-dir` too, and can be repeated in the
+same schema: old source events and saved analyses remain intact. CLI `evidence` and
+HTTP evidence use the same publication/snapshot service; `python -m aei state` shows
+the active run. Legacy `stats`/`compare` intentionally read the full event history.
+
+For HTTP replay, import the full source and run the API with lifespan enabled (the
+documented Uvicorn command does this by default):
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/replay/reset -Method Post -ContentType application/json -Body '{"seed_through":"2026-08-30","replay_through":"2026-09-27"}'
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/replay/step -Method Post
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/replay/start -Method Post -ContentType application/json -Body '{"interval_seconds":1}'
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/replay/pause -Method Post
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/state
+```
+
+- `reset` requires a complete source import. Without dates it seeds 28 days before
+  source end (clamped to source start minus one day), then replays through source end.
+  An explicit end must lie within the source span, and seed cannot exceed it.
+- `step` requires `paused` and advances exactly one date. Concurrent publication or
+  analysis can return 409 `publication_busy`; refresh state and retry. Send expected
+  state tokens to prevent a duplicate UI request from advancing a second day.
+- `start` resumes a paused run. Repeated starts while running keep the existing schedule.
+  The configurable delay is 0.05-60 seconds, with a worker polling every 0.2 seconds.
+  A persisted due time plus the database lock prevents multiple API workers from
+  publishing the same tick. Playback resumes after server restart if still running.
+- `pause` waits for a complete in-flight transaction before acknowledging. Reaching
+  the selected end gives `completed`; reset begins another run. A publication failure
+  rolls back visibility and clock, records `error`, and requires a reset after repair.
+
+`replay_runs` and `active_run` hold operational state. Append-only `run_cultures` and
+`run_isolates` store exact visible source versions and the revision that published
+each one. Append-only `saved_analyses` stores report payloads. Every step commits bundle
+membership, demo date and revision together. Reset never deletes source history or
+old reports. The metadata catalogs describe the full source, while evidence reads
+only exact event IDs published in the active run.
+
+This is a synthetic simulation, not a live Tyks connection. Legacy `/events` writes
+retain their original history/statistics behavior but **do not publish into replay**,
+including corrections. An external complete-bundle publication adapter is still needed
+before using the versioned evidence API with a live feed. State explicitly labels
+this behavior as `legacy_event_ingestion: history_only`.
 
 ## Verify
 
 ```powershell
-# Unit/API/reference tests; dataset test skips if the supplied ZIP is absent.
+# Unit/API/reference tests; supplied-data test skips if the source is absent.
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 
 # Include real PostgreSQL integration tests in disposable aei_test_* schemas.
@@ -136,9 +436,38 @@ $env:AEI_TEST_DATABASE_URL = 'postgresql://aei:aei_local_only@127.0.0.1:55432/ae
 Tests cover leap years, independent period selection, missing tests, the 29/30
 threshold, corrections, knowledge cutoffs, atomic conflicts, concurrent retries,
 append-only history, read-only SQLite migration, API behavior and the supplied data.
+Importer tests additionally cover ZIP/folder equivalence, short dates, validation,
+negative cultures, metadata revisions, concurrent imports and complete rollback.
+Evidence tests cover demographic selection, unknown metadata, combined ward counts,
+Wilson intervals, distinct suppression states, source coverage and concurrent snapshot reads.
+Publication tests cover complete/empty-day replay, rollback, stale run/revision tokens,
+concurrent steps/workers, pause acknowledgment, restart persistence, exports, HTTP/CLI
+agreement, structured errors and preventing staged future records from entering evidence.
+Comparison/history tests cover common-denominator suppression, all four S/R cells,
+drug-order reversal, missing tests, screening exclusions, independent windows,
+strict history boundaries, negative specimens, repeated isolates, revision corrections,
+hidden future IDs, cursor isolation, concurrent reset and preserved exports.
 `python -m aei schema` prints the versioned input contract.
 
-Still pending: Flink processing, persisted result/alert history, alert definitions,
-live notifications and the dashboard. Statistics currently run on demand or during
-replay and load source history in memory; this is a correctness reference, not a
+The supplied-data check replayed all 28 days through 2026-09-27, ending with 46,792
+cultures and 24,571 isolates. An independent SQL query matched the ED / E. coli /
+urine / CIP / female / age 65+ cohort: 15 tested (15 S, 0 R) in 28 days and 210 tested
+(199 S, 11 R) in 12 months. Reset reproduced the seed evidence and retained old
+JSON/CSV exports; the source archive and main event history were unchanged. On this
+development machine, publication of the 28 steps took about 3.5 seconds excluding
+staging, an uncached evidence query 2.6 seconds, and a cached query 0.03 seconds.
+These are local smoke-check timings, not production throughput guarantees.
+
+The comparison/history supplied-data check also passed: for the same ED / E. coli /
+urine / female / age 65+ cohort, CIP versus TMP had 15 paired tests in 28 days
+(percentages suppressed) and 210 in 12 months. The annual four-cell counts were
+166 both-S, 33 A-only-S, 9 B-only-S and 2 both-R, matching an independent SQL query.
+A selected patient's 18 prior cultures (9 negative/mixed) across nine pages matched
+the source specimens and every recorded AST result. Reset kept old history exports
+unchanged and hid future-only patient IDs. No source files or main event history changed.
+
+Still pending: alert rules and investigation, external complete-bundle publication,
+Flink, live notifications and the dashboard. Evidence, antibiotic comparison and patient
+history API views with saved exports are implemented. Calculations load published
+events in memory and serialize with replay publication; this is a correctness reference, not a
 production throughput claim. See [the Flink integration boundary](flink/README.md).

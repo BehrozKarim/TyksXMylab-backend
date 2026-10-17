@@ -216,7 +216,7 @@ class StoreAndAPITests(unittest.TestCase):
 
 
 class SuppliedDatasetTests(unittest.TestCase):
-    @unittest.skipUnless(DEFAULT_DATASET.is_file(), "Set AEI_DATASET_PATH to the supplied synthetic ZIP")
+    @unittest.skipUnless(DEFAULT_DATASET.exists(), "Set AEI_DATASET_PATH to the supplied synthetic ZIP or folder")
     def test_supplied_archive_loads_into_complete_events(self):
         events = load_dataset()
         self.assertEqual(len(events), 24571)
