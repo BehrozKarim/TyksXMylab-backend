@@ -50,6 +50,7 @@ def coverage_for(snapshot: EvidenceSnapshot, start, end) -> SourceCoverage:
     imported_enrichments = (len(snapshot.enrichments) if snapshot.imported_enrichments is None
                            else snapshot.imported_enrichments)
     return SourceCoverage(
+        includes_feed_data=snapshot.includes_feed_data,
         source_start=source_start, source_end=source_end, overlap_start=overlap_start, overlap_end=overlap_end,
         source_date_span_covers_window=bool(source_start and source_end and source_start <= start and end <= source_end),
         imported_culture_start=snapshot.imported_culture_start, imported_culture_end=snapshot.imported_culture_end,

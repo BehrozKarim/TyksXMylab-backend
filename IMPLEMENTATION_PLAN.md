@@ -38,8 +38,17 @@ low counts never clear an alert. The authored scenario generator demonstrates
 detection, insufficient evidence, clearance and recurrence in a separate schema.
 Defaults are urinary E. coli / CIP in PHC-S, PHC-N, ED and URO, with 10 percentage
 points; these remain proposals pending partner confirmation. The existing
-`selected_cohort` default is preserved. External bundle publication, dashboard/live
-notifications and Flink remain later work.
+`selected_cohort` default is preserved.
+
+The feed upgrade now implements complete-culture HTTP deliveries, a durable
+PostgreSQL inbox, idempotent receipts, background batch publication and SSE live
+notifications with reconnect recovery. Feed data, clock, alerts and notification
+commit together; failed batches roll back. Runs support simulated and UTC wall clocks,
+including quiet-day expiration. Full culture corrections retain history, and a separate
+HTTP dataset sender exercises arrivals without rewriting the source. Existing replay
+and saved analyses are preserved. See [FEED_INTEGRATION.md](FEED_INTEGRATION.md) for
+the contract, constraints, demonstration and frontend handoff. Dashboard wiring,
+laboratory-specific access/mapping and production operations remain; Flink is deferred.
 The original proposals below are retained for review; README and OpenAPI describe the
 implemented route names, response shapes and deliberate differences.
 

@@ -39,10 +39,18 @@ class ReplayReset(ExpectedState):
     replay_through: date | None = None
 
 
-class ReplayState(StrictModel):
+class FeedProvenance(StrictModel):
+    mode: Literal["replay", "feed"] = "replay"
+    clock_mode: Literal["simulated", "wall_utc"] = "simulated"
+    feed_source_id: str | None = None
+    feed_source_label: str | None = None
+    feed_data_digest: str | None = None
+
+
+class ReplayState(FeedProvenance):
     run_id: str
     state_revision: int = Field(ge=1)
-    status: Literal["paused", "running", "completed", "error"]
+    status: Literal["paused", "running", "completed", "error", "receiving"]
     demo_date: date
     seed_through: date
     replay_through: date
@@ -58,7 +66,7 @@ class ReplayState(StrictModel):
     legacy_event_ingestion: Literal["history_only"] = "history_only"
 
 
-class PublishedContext(EvidenceContext):
+class PublishedContext(EvidenceContext, FeedProvenance):
     run_id: str
     state_revision: int
     demo_date: date
@@ -71,7 +79,7 @@ class PublishedContext(EvidenceContext):
     visibility: Literal["published_culture_bundles"] = "published_culture_bundles"
 
 
-class SourceContext(StrictModel):
+class SourceContext(FeedProvenance):
     run_id: str
     state_revision: int
     demo_date: date

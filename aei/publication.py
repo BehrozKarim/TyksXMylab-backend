@@ -20,13 +20,16 @@ from .analysis_models import (
 from .comparisons import calculate_comparison
 from .evidence import calculate_evidence
 from .evidence_source import EvidenceUnavailable, snapshot_from_connection
+from .feed import FeedService
 from .history import history_page, history_start, patient_visible, search_patients
+from .live_store import record_notification
 from .models import AnalysisQuery
 from .publication_models import (
-    EvidenceRequest, ExpectedState, PublishedContext, ReplayReset, ReplayStart,
+    EvidenceRequest, ExpectedState, FeedProvenance, PublishedContext, ReplayReset, ReplayStart,
     ReplayState, SavedEvidence, ServiceError,
 )
 from .publication_store import publication_lock
+from .updates import UpdateStream
 
 
 logger = logging.getLogger(__name__)
@@ -36,6 +39,8 @@ class PublicationService:
     def __init__(self, store, *, alert_configuration=None):
         self.store = store
         self.alert_engine = AlertEngine(alert_configuration if alert_configuration is not None else load_alert_configuration())
+        self.feed = FeedService(self)
+        self.updates = UpdateStream(self)
 
     @contextmanager
     def locked(self, *, wait=True):
@@ -53,6 +58,14 @@ class PublicationService:
             raise EvidenceUnavailable("Import a validated dataset before using published evidence or replay")
         return row
 
+    def _complete_source(self, db):
+        manifest, kind = self._source(db)
+        count = db.execute("SELECT COUNT(*) FROM culture_events WHERE origin='dataset'").fetchone()[0]
+        enriched = db.execute("SELECT COUNT(*) FROM isolate_enrichments WHERE origin='dataset'").fetchone()[0]
+        if count != manifest["files"]["cultures.csv"]["rows"] or enriched != manifest["files"]["isolates.csv"]["rows"]:
+            raise ServiceError(409, "incomplete_source", "Import the complete seed source before starting a new replay or feed run")
+        return manifest, kind
+
     def _active(self, db, *, initialize=True):
         row = db.execute("""SELECT r.payload FROM replay_runs r
             JOIN active_run a USING (run_id)""").fetchone()
@@ -60,29 +73,32 @@ class PublicationService:
             state = ReplayState.model_validate(row[0])
             if initialize:
                 self.alert_engine.ensure(db, state)
+                record_notification(db, state)
             return state
         if not initialize:
             return None
         manifest, kind = self._source(db)
-        end = db.execute("SELECT MAX(sample_date) FROM culture_events").fetchone()[0]
+        end = db.execute("SELECT MAX(sample_date) FROM culture_events WHERE origin='dataset'").fetchone()[0]
         if end is None:
             raise EvidenceUnavailable("Import at least one complete culture before creating a run")
         # First use exposes the already imported complete bundles; later imports
         # never silently change this run. Reset explicitly publishes a new source view.
         return self._create_run(db, manifest, kind, end, end)
 
-    def _create_run(self, db, manifest, kind, seed, through):
+    def _create_run(self, db, manifest, kind, seed, through, **provenance):
         AnalysisQuery(as_of=seed, period="rolling_12_months")
         now = datetime.now(timezone.utc)
         state = ReplayState(run_id=str(uuid4()), state_revision=1,
-            status="completed" if seed == through else "paused", demo_date=seed,
+            status="receiving" if provenance.get("mode") == "feed" else "completed" if seed == through else "paused", demo_date=seed,
             seed_through=seed, replay_through=through, latest_visible_sample_date=None,
             published_cultures=0, published_isolates=0,
             source_manifest_id=manifest["manifest_id"], source_kind=kind,
-            created_at=now, updated_at=now)
+            created_at=now, updated_at=now, **provenance)
         db.execute("INSERT INTO replay_runs (run_id, manifest_id, payload) VALUES (%s, %s, %s)",
                    (state.run_id, state.source_manifest_id, Jsonb(state.model_dump(mode="json"))))
         state = self._publish(db, state, seed)
+        if state.mode == "feed":
+            state = state.model_copy(update={"demo_date": through})
         self._save(db, state)
         self.alert_engine.ensure(db, state)
         db.execute("""INSERT INTO active_run (singleton, run_id) VALUES (TRUE, %s)
@@ -92,7 +108,7 @@ class PublicationService:
     def _publish(self, db, state, through, from_date=date.min):
         # All cultures, including negative and mixed-growth samples, are published.
         cultures = db.execute("""INSERT INTO run_cultures (run_id, event_id, published_revision)
-            SELECT %s, event_id, %s FROM culture_events WHERE sample_date BETWEEN %s AND %s
+            SELECT %s, event_id, %s FROM culture_events WHERE origin='dataset' AND sample_date BETWEEN %s AND %s
             ON CONFLICT DO NOTHING""", (state.run_id, state.state_revision, from_date, through)).rowcount
         isolates = db.execute("""INSERT INTO run_isolates (run_id, event_id, published_revision)
             SELECT %s, e.event_id, %s FROM isolate_enrichments e
@@ -108,6 +124,7 @@ class PublicationService:
     def _save(self, db, state, next_tick=None):
         db.execute("UPDATE replay_runs SET payload=%s, next_tick_at=%s WHERE run_id=%s",
                    (Jsonb(state.model_dump(mode="json")), next_tick, state.run_id))
+        record_notification(db, state)
 
     def _check(self, state, expected):
         if expected.expected_run_id is not None and (
@@ -116,6 +133,14 @@ class PublicationService:
                                {"state": state.model_dump(mode="json")})
 
     def state(self):
+        # State/SSE can read the last committed revision while a worker calculates
+        # the next one. Bootstrap old schemas once under the publication lock.
+        with self.store.connection() as db:
+            row = db.execute("""SELECT n.payload FROM active_run a JOIN replay_runs r USING(run_id)
+                JOIN publication_notifications n ON n.run_id=r.run_id
+                AND n.state_revision=(r.payload->>'state_revision')::bigint""").fetchone()
+            if row:
+                return ReplayState.model_validate(row[0])
         with self.locked() as db:
             return self._active(db)
 
@@ -123,18 +148,14 @@ class PublicationService:
         with self.locked() as db:
             previous = self._active(db)
             self._check(previous, request)
-            manifest, kind = self._source(db)
-            count = db.execute("SELECT COUNT(*) FROM culture_events").fetchone()[0]
-            enriched = db.execute("SELECT COUNT(*) FROM isolate_enrichments").fetchone()[0]
-            if count != manifest["files"]["cultures.csv"]["rows"] or enriched != manifest["files"]["isolates.csv"]["rows"]:
-                raise ServiceError(409, "incomplete_source", "Import the complete source before resetting replay")
+            manifest, kind = self._complete_source(db)
             start, end = date.fromisoformat(manifest["source_start"]), date.fromisoformat(manifest["source_end"])
             through = request.replay_through or end
             seed = request.seed_through or max(start - timedelta(days=1), through - timedelta(days=28))
             if not start <= through <= end or not start - timedelta(days=1) <= seed <= through:
                 raise ServiceError(422, "invalid_replay_range",
                     "Replay must end within the source dates; seed must be between source start minus one day and replay end")
-            if previous.status == "running":
+            if previous.status in ("running", "receiving"):
                 self._save(db, previous.model_copy(update={"status": "paused",
                     "state_revision": previous.state_revision + 1, "updated_at": datetime.now(timezone.utc)}))
             return self._create_run(db, manifest, kind, seed, through)
@@ -143,6 +164,8 @@ class PublicationService:
         with self.locked() as db:
             state = self._active(db)
             self._check(state, request)
+            if state.mode != "replay":
+                raise ServiceError(409, "feed_run_active", "Use replay reset to return from feed mode to dataset replay")
             if state.status == "running":
                 return state  # Repeated start never creates a second schedule.
             if state.status != "paused":
@@ -157,6 +180,8 @@ class PublicationService:
         with self.locked() as db:
             state = self._active(db)
             self._check(state, request)
+            if state.mode != "replay":
+                raise ServiceError(409, "feed_run_active", "Use replay reset to leave feed mode")
             if state.status == "running":
                 state = state.model_copy(update={"status": "paused", "state_revision": state.state_revision + 1,
                                                  "updated_at": datetime.now(timezone.utc)})
@@ -181,6 +206,8 @@ class PublicationService:
         with self.locked(wait=False) as db:
             state = self._active(db)
             self._check(state, request)
+            if state.mode != "replay":
+                raise ServiceError(409, "feed_run_active", "A feed's clock is advanced by feed publication")
             if state.status != "paused":
                 raise ServiceError(409, "replay_not_paused", "A single step requires a paused run")
             return self._advance(db, state)
@@ -230,7 +257,8 @@ class PublicationService:
                 state_revision=state.state_revision, demo_date=state.demo_date,
                 published_cultures=state.published_cultures, published_isolates=state.published_isolates,
                 latest_visible_sample_date=state.latest_visible_sample_date, source_kind=state.source_kind,
-                source_files=snapshot.manifest.files, importer_version=snapshot.manifest.importer_version)
+                source_files=snapshot.manifest.files, importer_version=snapshot.manifest.importer_version,
+                **state.model_dump(include=set(FeedProvenance.model_fields)))
             saved = SavedEvidence(analysis_id=str(uuid4()), context=context, windows=report.windows)
             return self._persist(db, saved, "evidence", key)
 
@@ -257,7 +285,9 @@ class PublicationService:
             VALUES (%s, %s, %s, %s, %s, %s, %s)""",
             (saved.analysis_id, saved.context.run_id, saved.context.state_revision, saved.context.method_version,
              kind, key, Jsonb(saved.model_dump(mode="json"))))
-        return saved
+        # Mark the persisted defaults as present. Older stored documents can then
+        # be exported with exclude_unset without gaining fields from a later schema.
+        return type(saved).model_validate(saved.model_dump(mode="json"))
 
     def _source_context(self, db, state):
         manifest, _ = self._source(db)
@@ -329,8 +359,10 @@ class PublicationService:
             return self._read_analysis(db, analysis_id)
 
     def alerts(self, request: AlertListRequest):
-        with self.locked() as db:
-            state = self._active(db)
+        self.state()  # Initialize if necessary, then read one committed snapshot.
+        with self.store.connection() as db:
+            db.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            state = self._active(db, initialize=False)
             self._check(state, request)
             return self.alert_engine.list(db, state, request)
 
@@ -361,7 +393,9 @@ class PublicationService:
                 "source": {"kind": kind, "manifest_id": manifest["manifest_id"],
                            "start_date": manifest["source_start"], "end_date": manifest["source_end"]},
                 "wards": wards, "antibiotics": drugs,
-                "organisms": sorted({panel["organism"] for panel in manifest["observed_panels"]}),
+                "organisms": sorted({panel["organism"] for panel in manifest["observed_panels"]} |
+                    {row[0] for row in db.execute("""SELECT DISTINCT e.payload->>'organism' FROM isolate_events e
+                        JOIN run_isolates r USING(event_id) WHERE r.run_id=%s""", (state.run_id,))}),
                 "specimens": ["urine", "blood", "wound"], "sex": ["F", "M"],
                 "dedup_scopes": ["selected_cohort", "all_wards"],
                 "comparison_antibiotics": [drug["antibiotic_code"] for drug in drugs if not drug["is_screening"]],
@@ -371,11 +405,14 @@ class PublicationService:
                 "observed_panels": manifest["observed_panels"], "warnings": manifest.get("warnings", []),
                 "limitations": ["Synthetic laboratory susceptibility; not treatment efficacy",
                     "Metadata and panel availability describe the full source, not future patient results",
-                    "Only published complete source bundles enter evidence; legacy event writes remain outside replay",
+                    "Only published complete bundles enter evidence; legacy event writes remain history-only",
                     "Same-day ordering, ward-transfer policy and untested-first-isolate policy await partner confirmation",
                     "Patient history shows collection dates and raw recorded AST, not treatment outcomes",
                     "Alert thresholds, baseline and monitored groups are proposed heuristics awaiting partner confirmation",
-                    "Dashboard, external bundle publication, push notifications and Flink are not implemented"]}
+                    "Feed ingestion and SSE are available; connecting a specific laboratory requires its adapter and access",
+                    "Dataset file hashes describe the seed; feed payloads have separate receipt hashes and a run digest",
+                    "Retractions and isolate-set changes in feed corrections are not supported",
+                    "Dashboard and Flink are not implemented"]}
 
 
 def export_csv(report: SavedAnalysis) -> str:
@@ -391,7 +428,7 @@ def export_csv(report: SavedAnalysis) -> str:
                 result[name] = "'" + item if isinstance(item, str) and item.startswith(("=", "+", "-", "@", "\t", "\r")) else item
         return result
 
-    document = report.model_dump(mode="json")
+    document = report.model_dump(mode="json", exclude_unset=True)
     common = flatten({"analysis_id": document["analysis_id"], "context": document["context"]})
     if isinstance(report, SavedEvidence):
         rows = [{**common, **flatten(window)} for window in document["windows"].values()]

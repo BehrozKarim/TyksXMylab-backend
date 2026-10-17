@@ -5,7 +5,7 @@ import time
 from datetime import date, timedelta
 from pathlib import Path
 
-from .config import database_url
+from .config import database_schema, database_url
 from .dataset import DatasetValidationError, default_dataset, load_bundle
 from .evidence import EvidenceQueryError
 from .evidence_source import EvidenceUnavailable
@@ -21,7 +21,7 @@ from .store import EventConflict
 def main():
     parser = argparse.ArgumentParser(description="Run the AEI reference pipeline before adding Flink")
     parser.add_argument("--database-url", default=database_url(), help="PostgreSQL URL (or AEI_DATABASE_URL)")
-    parser.add_argument("--schema", default="aei", help="PostgreSQL schema; use a separate schema for replay")
+    parser.add_argument("--schema", default=database_schema(), help="PostgreSQL schema (or AEI_DATABASE_SCHEMA)")
     commands = parser.add_subparsers(dest="command", required=True)
 
     def add_source(command):

@@ -21,6 +21,7 @@ from psycopg import sql
 
 from aei.api import create_app
 from aei.dataset import load_bundle
+from aei.feed_models import FeedStart
 from aei.publication import PublicationService, export_csv
 from aei.publication_models import EvidenceRequest, ExpectedState, ReplayReset, ReplayStart, ServiceError
 from aei.postgres import PostgresEventStore
@@ -137,6 +138,9 @@ class PublicationTests(unittest.TestCase):
         self.assertFalse(saved.windows.rolling_28_days.coverage.source_fully_imported)
         with self.assertRaises(ServiceError) as caught:
             self.reset()
+        self.assertEqual(caught.exception.code, "incomplete_source")
+        with self.assertRaises(ServiceError) as caught:
+            self.service.feed.start(FeedStart(source_id="partial", source_label="Partial source test"))
         self.assertEqual(caught.exception.code, "incomplete_source")
         self.store.import_dataset(bundle)
         self.assertEqual(self.report(), saved)

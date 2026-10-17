@@ -3,7 +3,7 @@ from typing import Annotated
 from fastapi import Body, FastAPI, HTTPException, Query
 
 from .api_v1 import install_v1, replay_lifespan
-from .config import database_url as configured_database_url
+from .config import database_schema, database_url as configured_database_url
 from .models import AnalysisQuery, AnalysisResult, ComparisonResult, IsolateEvent
 from .postgres import PostgresEventStore
 from .processor import Processor, ReferenceProcessor, compare_periods
@@ -13,15 +13,15 @@ from .store import EventConflict, EventStore
 
 def create_app(database_url: str | None = None, processor: Processor | None = None,
                *, store: EventStore | None = None) -> FastAPI:
-    store = store if store is not None else PostgresEventStore(database_url or configured_database_url())
+    store = store if store is not None else PostgresEventStore(database_url or configured_database_url(), database_schema())
     calculation = processor or ReferenceProcessor()
     publication = PublicationService(store) if isinstance(store, PostgresEventStore) else None
     app = FastAPI(
         title="Tyks AEI reference pipeline",
-        version="0.6.0",
+        version="0.7.0",
         lifespan=replay_lifespan(publication),
         description=("PostgreSQL event history and reference calculations for rolling 28-day and "
-                     "12-month reports, versioned resistance alerts and saved investigations. "
+                     "12-month reports, versioned resistance alerts, durable external feeds and SSE updates. "
                      "Flink and a dashboard are not active yet."),
     )
 

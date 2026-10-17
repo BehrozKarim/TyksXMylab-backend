@@ -73,7 +73,8 @@ def calculate_alert(snapshot, monitor, configuration, as_of):
     """Compare disjoint periods with an exact rational threshold comparison."""
     if monitor.ward_code and monitor.ward_code not in snapshot.ward_codes:
         return AlertCalculation(status="unavailable", reason="unknown_ward")
-    if monitor.organism not in {panel.organism for panel in snapshot.manifest.observed_panels}:
+    if monitor.organism not in ({panel.organism for panel in snapshot.manifest.observed_panels}
+                                | {item.organism for item in snapshot.events}):
         return AlertCalculation(status="unavailable", reason="unknown_organism")
     drug = snapshot.antibiotics.get(monitor.antibiotic_code)
     if drug is None:
