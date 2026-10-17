@@ -1,6 +1,7 @@
 """Local demo supervisor: real HTTP deliveries, isolated state, unchanged source data."""
 
 import argparse
+import json
 import os
 from pathlib import Path
 import re
@@ -254,6 +255,20 @@ def free_port(port):
             raise DemoError(f"Port {port} is already in use. Stop that service or select another demo port.") from exc
 
 
+def validate_frontend_dependencies(frontend):
+    """Fail before starting services when a checkout's declared packages are missing."""
+    try:
+        manifest = json.loads((frontend / "package.json").read_text(encoding="utf-8"))
+        packages = set(manifest.get("dependencies", {})) | set(manifest.get("devDependencies", {}))
+    except (OSError, ValueError, TypeError) as exc:
+        raise DemoError(f"Cannot read frontend package.json in {frontend}.") from exc
+    missing = sorted(name for name in packages
+                     if not (frontend / "node_modules" / name / "package.json").is_file())
+    if missing:
+        raise DemoError(f"Frontend dependencies are missing: {', '.join(missing)}. "
+                        f"Run npm.cmd ci in {frontend} before launching the demo.")
+
+
 def parser():
     command = argparse.ArgumentParser(description=__doc__)
     command.add_argument("--source", type=Path, help="Synthetic ZIP or CSV directory")
@@ -284,6 +299,7 @@ def run(args):
     node = shutil.which("node")
     if not node or not vite.is_file():
         raise DemoError(f"Node and frontend dependencies are required. Run npm.cmd ci in {frontend} first.")
+    validate_frontend_dependencies(frontend)
     for port in (args.backend_port, args.frontend_port):
         free_port(port)
     if not args.skip_docker:

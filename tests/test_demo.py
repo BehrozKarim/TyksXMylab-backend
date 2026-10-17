@@ -2,6 +2,7 @@
 
 from contextlib import redirect_stdout
 import io
+import json
 import os
 from pathlib import Path
 import socket
@@ -20,7 +21,7 @@ import psycopg
 from psycopg import sql
 
 from aei.demo import (DemoError, DemoSession, Processes, deliver, demo_plan, free_port,
-                      install_interrupt_handlers, resolve_source)
+                      install_interrupt_handlers, resolve_source, validate_frontend_dependencies)
 from aei.feed_models import FeedStart
 from aei.demo_control import DemoControls
 from aei.publication import PublicationService
@@ -30,6 +31,24 @@ from test_live_feed import live_server
 
 
 class DemoUnitTests(unittest.TestCase):
+    def test_missing_new_font_dependency_fails_before_dashboard_startup(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'package.json').write_text(json.dumps({
+                'dependencies': {'react': '19', '@fontsource/barlow': '5'},
+                'devDependencies': {'vite': '7'},
+            }), encoding='utf-8')
+            for package in ('react', 'vite'):
+                installed = root / 'node_modules' / package
+                installed.mkdir(parents=True)
+                (installed / 'package.json').write_text('{}', encoding='utf-8')
+            with self.assertRaisesRegex(DemoError, r'@fontsource/barlow.*npm.cmd ci'):
+                validate_frontend_dependencies(root)
+            font = root / 'node_modules/@fontsource/barlow'
+            font.mkdir(parents=True)
+            (font / 'package.json').write_text('{}', encoding='utf-8')
+            validate_frontend_dependencies(root)
+
     def test_controls_require_proxy_credential_and_dashboard_origin(self):
         with DemoControls('demo-run', ['http://localhost:5173']) as control, httpx.Client(
                 base_url=control.url, trust_env=False) as client:
@@ -54,7 +73,7 @@ class DemoUnitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {}, clear=True):
             root = Path(folder)
             (root / 'synthetic_microbiology_dataset').mkdir()
-            self.assertEqual(resolve_source(root=root), root / 'synthetic_microbiology_dataset')
+            self.assertEqual(resolve_source(root=root), (root / 'synthetic_microbiology_dataset').resolve())
             with self.assertRaisesRegex(DemoError, 'Dataset not found'):
                 resolve_source(root / 'missing.zip', root=root)
 
@@ -64,7 +83,7 @@ class DemoUnitTests(unittest.TestCase):
             (root / '.data').mkdir()
             archive = root / '.data/synthetic_microbiology_dataset.zip'
             archive.touch()
-            self.assertEqual(resolve_source(root=root), archive)
+            self.assertEqual(resolve_source(root=root), archive.resolve())
             with patch.dict(os.environ, {'AEI_DATASET_PATH': str(root / 'absent')}):
                 with self.assertRaises(DemoError):
                     resolve_source(root=root)
