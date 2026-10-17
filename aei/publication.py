@@ -11,6 +11,8 @@ from uuid import uuid4
 
 from psycopg.types.json import Jsonb
 
+from .alert_models import AlertListRequest, SavedAlertAnalysis, load_alert_configuration
+from .alert_store import AlertEngine
 from .analysis_models import (
     ComparisonContext, ComparisonRequest, HistoryContext, HistoryRequest, PatientSearchRequest,
     PatientSearchResult, SavedAnalysis, SavedComparison, SavedHistory, SourceContext,
@@ -31,8 +33,9 @@ logger = logging.getLogger(__name__)
 
 
 class PublicationService:
-    def __init__(self, store):
+    def __init__(self, store, *, alert_configuration=None):
         self.store = store
+        self.alert_engine = AlertEngine(alert_configuration if alert_configuration is not None else load_alert_configuration())
 
     @contextmanager
     def locked(self, *, wait=True):
@@ -54,7 +57,10 @@ class PublicationService:
         row = db.execute("""SELECT r.payload FROM replay_runs r
             JOIN active_run a USING (run_id)""").fetchone()
         if row:
-            return ReplayState.model_validate(row[0])
+            state = ReplayState.model_validate(row[0])
+            if initialize:
+                self.alert_engine.ensure(db, state)
+            return state
         if not initialize:
             return None
         manifest, kind = self._source(db)
@@ -78,6 +84,7 @@ class PublicationService:
                    (state.run_id, state.source_manifest_id, Jsonb(state.model_dump(mode="json"))))
         state = self._publish(db, state, seed)
         self._save(db, state)
+        self.alert_engine.ensure(db, state)
         db.execute("""INSERT INTO active_run (singleton, run_id) VALUES (TRUE, %s)
             ON CONFLICT (singleton) DO UPDATE SET run_id=EXCLUDED.run_id""", (state.run_id,))
         return state
@@ -157,6 +164,7 @@ class PublicationService:
             return state
 
     def _advance(self, db, state):
+        self.alert_engine.ensure(db, state)
         state = state.model_copy(update={"state_revision": state.state_revision + 1})
         day = state.demo_date + timedelta(days=1)
         state = self._publish(db, state, day, day)
@@ -166,6 +174,7 @@ class PublicationService:
         due = (datetime.now(timezone.utc) + timedelta(seconds=state.interval_seconds)
                if state.status == "running" else None)
         self._save(db, state, due)
+        self.alert_engine.evaluate(db, state)
         return state
 
     def step(self, request: ExpectedState):
@@ -319,11 +328,24 @@ class PublicationService:
         with self.store.connection() as db:
             return self._read_analysis(db, analysis_id)
 
+    def alerts(self, request: AlertListRequest):
+        with self.locked() as db:
+            state = self._active(db)
+            self._check(state, request)
+            return self.alert_engine.list(db, state, request)
+
+    def investigation(self, alert_id, request: ExpectedState):
+        with self.locked() as db:
+            state = self._active(db)
+            self._check(state, request)
+            return self.alert_engine.investigation(db, state, alert_id)
+
     def _read_analysis(self, db, analysis_id):
         row = db.execute("SELECT kind, payload FROM saved_analyses WHERE analysis_id=%s", (analysis_id,)).fetchone()
         if row is None:
             raise ServiceError(404, "analysis_not_found", "Saved analysis not found")
-        model = {"evidence": SavedEvidence, "comparison": SavedComparison, "history": SavedHistory}[row[0]]
+        model = {"evidence": SavedEvidence, "comparison": SavedComparison, "history": SavedHistory,
+                 "alert": SavedAlertAnalysis}[row[0]]
         return model.model_validate(row[1])
 
     def meta(self):
@@ -343,14 +365,17 @@ class PublicationService:
                 "specimens": ["urine", "blood", "wound"], "sex": ["F", "M"],
                 "dedup_scopes": ["selected_cohort", "all_wards"],
                 "comparison_antibiotics": [drug["antibiotic_code"] for drug in drugs if not drug["is_screening"]],
-                "analysis_methods": {"evidence": "evidence-v1", "comparison": "comparison-v1", "history": "history-v1"},
+                "analysis_methods": {"evidence": "evidence-v1", "comparison": "comparison-v1", "history": "history-v1",
+                                     "alert": "alert-v1"},
+                "alert_configuration": self.alert_engine.configuration_for(db, state.run_id).model_dump(mode="json"),
                 "observed_panels": manifest["observed_panels"], "warnings": manifest.get("warnings", []),
                 "limitations": ["Synthetic laboratory susceptibility; not treatment efficacy",
                     "Metadata and panel availability describe the full source, not future patient results",
                     "Only published complete source bundles enter evidence; legacy event writes remain outside replay",
                     "Same-day ordering, ward-transfer policy and untested-first-isolate policy await partner confirmation",
                     "Patient history shows collection dates and raw recorded AST, not treatment outcomes",
-                    "Alerts, dashboard, external bundle publication and Flink are not implemented"]}
+                    "Alert thresholds, baseline and monitored groups are proposed heuristics awaiting partner confirmation",
+                    "Dashboard, external bundle publication, push notifications and Flink are not implemented"]}
 
 
 def export_csv(report: SavedAnalysis) -> str:
@@ -372,6 +397,14 @@ def export_csv(report: SavedAnalysis) -> str:
         rows = [{**common, **flatten(window)} for window in document["windows"].values()]
     elif isinstance(report, SavedComparison):
         rows = [{**common, "record_type": "paired_comparison", **flatten(document["comparison"])}]
+    elif isinstance(report, SavedAlertAnalysis):
+        evaluation = document["evaluation"]
+        common.update(flatten({"evaluation": {key: value for key, value in evaluation.items()
+                                             if key not in ("baseline", "recent")}}))
+        rows = [{**common, "record_type": "alert_window", "window": name, **flatten(window)}
+                for name in ("baseline", "recent") if (window := evaluation[name]) is not None]
+        if not rows:
+            rows = [{**common, "record_type": "alert_unavailable"}]
     else:
         rows = []
         page = {"has_more": report.has_more, "next_cursor": report.next_cursor}

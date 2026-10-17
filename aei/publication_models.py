@@ -71,6 +71,21 @@ class PublishedContext(EvidenceContext):
     visibility: Literal["published_culture_bundles"] = "published_culture_bundles"
 
 
+class SourceContext(StrictModel):
+    run_id: str
+    state_revision: int
+    demo_date: date
+    published_cultures: int
+    published_isolates: int
+    latest_visible_sample_date: date | None
+    source_manifest_id: str
+    source_kind: Literal["zip", "directory"]
+    source_files: dict[str, FileSummary]
+    importer_version: str
+    generated_at: AwareDatetime
+    visibility: Literal["published_culture_bundles"] = "published_culture_bundles"
+
+
 class SavedEvidence(StrictModel):
     analysis_id: str
     context: PublishedContext
