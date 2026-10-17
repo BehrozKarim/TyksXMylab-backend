@@ -9,6 +9,7 @@ import psycopg
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
+from .alert_store import initialize_alert_tables
 from .dataset_store import import_bundle, initialize_dataset_tables
 from .evidence_source import read_evidence_snapshot
 from .models import IsolateEvent
@@ -50,6 +51,7 @@ class PostgresEventStore:
                 FOR EACH STATEMENT EXECUTE FUNCTION reject_event_mutation()""")
             initialize_dataset_tables(db)
             initialize_publication_tables(db)
+            initialize_alert_tables(db)
 
     @contextmanager
     def connection(self):

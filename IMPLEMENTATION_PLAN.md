@@ -29,8 +29,17 @@ comparisons use the existing cohort policy and require 30 common tested isolates
 history retains every prior published specimen with revision-bound pagination.
 Both report types are frozen and exportable. The history range is the prior calendar
 anniversary inclusive through the selected cutoff exclusive, as specified below.
-Alerts/investigation, external bundle publication, dashboard/live notifications and
-Flink remain later work.
+The B6 upgrade now implements `/api/v1/alerts`, `/investigations/{id}` and frozen
+`alert-v1` analyses/exports. The versioned `resistance-rise-v1` heuristic uses the
+non-overlapping baseline in section 9, minimum 30 per period, exact threshold
+comparison, run-frozen configurable monitors, stable alert IDs, transition history
+and original/current investigation snapshots. Monitor evaluation commits with replay;
+low counts never clear an alert. The authored scenario generator demonstrates
+detection, insufficient evidence, clearance and recurrence in a separate schema.
+Defaults are urinary E. coli / CIP in PHC-S, PHC-N, ED and URO, with 10 percentage
+points; these remain proposals pending partner confirmation. The existing
+`selected_cohort` default is preserved. External bundle publication, dashboard/live
+notifications and Flink remain later work.
 The original proposals below are retained for review; README and OpenAPI describe the
 implemented route names, response shapes and deliberate differences.
 

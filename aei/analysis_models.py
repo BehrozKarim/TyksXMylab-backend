@@ -6,10 +6,11 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, Field, model_validator
 
-from .dataset_models import CultureRecord, FileSummary, IsolateEnrichment
+from .alert_models import SavedAlertAnalysis
+from .dataset_models import CultureRecord, IsolateEnrichment
 from .evidence_models import CohortQuery, MetadataCompleteness, SourceCoverage
 from .models import AnalysisQuery, IsolateEvent, StrictModel
-from .publication_models import ExpectedState, SavedEvidence
+from .publication_models import ExpectedState, SavedEvidence, SourceContext
 
 
 class ComparisonQuery(CohortQuery):
@@ -62,21 +63,6 @@ class PairedComparison(StrictModel):
     at_least_one_s_pct: float | None
     metadata: MetadataCompleteness
     coverage: SourceCoverage
-
-
-class SourceContext(StrictModel):
-    run_id: str
-    state_revision: int
-    demo_date: date
-    published_cultures: int
-    published_isolates: int
-    latest_visible_sample_date: date | None
-    source_manifest_id: str
-    source_kind: Literal["zip", "directory"]
-    source_files: dict[str, FileSummary]
-    importer_version: str
-    generated_at: AwareDatetime
-    visibility: Literal["published_culture_bundles"] = "published_culture_bundles"
 
 
 class ComparisonContext(SourceContext):
@@ -171,4 +157,4 @@ class SavedHistory(StrictModel):
     next_cursor: str | None
 
 
-SavedAnalysis = SavedEvidence | SavedComparison | SavedHistory
+SavedAnalysis = SavedEvidence | SavedComparison | SavedHistory | SavedAlertAnalysis

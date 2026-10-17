@@ -1,6 +1,6 @@
 """Read one consistent PostgreSQL snapshot for both evidence windows."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 
 from .dataset_models import AntibioticRecord, DatasetManifest, IsolateEnrichment
@@ -18,6 +18,7 @@ class EvidenceSnapshot:
     imported_culture_start: date | None
     imported_culture_end: date | None
     imported_enrichments: int | None = None
+    ward_types: dict[str, str] = field(default_factory=dict)
 
 
 class EvidenceUnavailable(ValueError):
@@ -49,10 +50,11 @@ def snapshot_from_connection(db, run_id: str | None = None) -> EvidenceSnapshot:
     antibiotics = [AntibioticRecord.model_validate({key: value for key, value in row[0].items()
                                                    if key != "is_screening"}) for row in
                    db.execute("SELECT payload FROM antibiotics").fetchall()]
-    wards = frozenset(row[0] for row in db.execute("SELECT ward_code FROM wards").fetchall())
+    ward_types = {row[0]: row[1]["ward_type"] for row in db.execute("SELECT ward_code, payload FROM wards")}
+    wards = frozenset(ward_types)
     count, start, end = db.execute("SELECT COUNT(*), MIN(sample_date), MAX(sample_date) FROM culture_events").fetchone()
     enriched = db.execute("SELECT COUNT(*) FROM isolate_enrichments").fetchone()[0]
     return EvidenceSnapshot(events=events, enrichments={item.event_id: item for item in metadata},
         antibiotics={item.antibiotic_code: item for item in antibiotics}, ward_codes=wards,
         manifest=manifest, imported_cultures=count, imported_culture_start=start, imported_culture_end=end,
-        imported_enrichments=enriched)
+        imported_enrichments=enriched, ward_types=ward_types)

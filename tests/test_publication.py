@@ -117,7 +117,9 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "stale_state")
         self.assertEqual(caught.exception.details["state"]["run_id"], new.run_id)
         with self.store.connection() as db:
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM saved_analyses").fetchone()[0], 0)
+            # Automatic monitor snapshots can exist, but a rejected evidence
+            # request must never persist a user analysis.
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM saved_analyses WHERE kind != 'alert'").fetchone()[0], 0)
 
     def test_future_date_and_invalid_reset_leave_current_state_unchanged(self):
         self.import_source()

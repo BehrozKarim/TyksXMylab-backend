@@ -73,6 +73,11 @@ def eligible_for_period(snapshot, latest, query, period):
     """Choose first isolates before demographic filters or antibiotic availability."""
     selection = AnalysisQuery(as_of=query.as_of, period=period, ward_code=query.ward_code,
         organism=query.organism, specimen=query.specimen, dedup_scope=query.dedup_scope)
+    return eligible_for_selection(snapshot, latest, query, selection)
+
+
+def eligible_for_selection(snapshot, latest, query, selection):
+    """Shared first-isolate/demographic ordering, also for explicit alert bounds."""
     first = select_first_isolates(latest, selection)
     eligible = []
     unknown_sex = unknown_age = excluded_unknown = excluded_nonmatching = 0

@@ -1,11 +1,12 @@
 # Tyks AEI backend
 
 Current flow: **CSV archive/folder -> validated source bundles in PostgreSQL -> published
-replay run -> Python reference processor -> saved evidence and JSON/CSV exports**.
+replay run -> Python reference processor -> saved evidence, resistance alerts and JSON/CSV exports**.
 The original event-ingestion and statistics endpoints also remain available.
 PostgreSQL runs in Docker with a persistent
 volume. Annual results now mean **rolling last 12 calendar months**, alongside the
-rolling last 28 days. Flink, alerts and a dashboard are not active yet.
+rolling last 28 days. The backend includes configurable resistance alerts and
+investigation APIs. Flink and a dashboard are not active yet.
 
 ## Start the database and backend
 
@@ -224,7 +225,7 @@ bounds. Suppressed percentages/intervals are empty; counts and status are retain
 Spreadsheet formula prefixes in source labels are escaped with a leading apostrophe.
 
 For coordinated reads, send `expected_run_id` and `expected_revision` together, using
-`/api/v1/state`. Evidence, comparison, patient search and history accept them as query parameters; replay controls accept them
+`/api/v1/state`. Evidence, comparison, patient search, history, alerts and investigations accept them as query parameters; replay controls accept them
 in the JSON body. A mismatch returns HTTP 409 with `error.details.state` and creates
 no analysis. Omitting both uses whichever state is current when the request acquires
 the lock. Clients may poll state every two seconds; push notifications are not implemented.
@@ -278,6 +279,125 @@ These are laboratory observations, with no drug ranking, synergy or treatment-ef
 Comparison responses carry a saved `analysis_id` and full source/run/filter context.
 JSON export preserves the response; CSV has one `paired_comparison` row, including
 all cells, denominators, missing counts, suppressed values and provenance.
+
+### Resistance alerts and investigations
+
+```text
+GET /api/v1/alerts
+GET /api/v1/alerts?states=cleared&states=ongoing
+GET /api/v1/investigations/{investigation_id}
+GET /api/v1/analyses/{analysis_id}
+GET /api/v1/analyses/{analysis_id}/export?format=json
+GET /api/v1/analyses/{analysis_id}/export?format=csv
+```
+
+The `resistance-rise-v1` rule is a **proposed heuristic for review**, with no p-value,
+significance, outbreak, causal or treatment-efficacy claim. For monitoring date T,
+recent start R is T minus 27 days. Compare recent `[R, T+1 day)` with the disjoint
+baseline `[R minus 12 calendar months, R)`. On 2026-09-27 these are
+`[2026-08-31, 2026-09-28)` and `[2025-08-31, 2026-08-31)`. Start dates are inclusive;
+`end_date_exclusive` is excluded. A leap-day baseline anniversary clamps to February 28.
+This baseline deliberately differs from the dashboard's rolling-year report ending at T.
+
+Each period independently uses the shared latest-revision and first-isolate rules,
+including the existing `selected_cohort` ward default, deterministic same-day ties,
+demographic filters after first selection, and no replacement of an untested first
+isolate. Each period needs **30 tested isolates**. The default trigger is recent
+resistance minus baseline resistance **>=10 percentage points** (20% to 30%, for example).
+The decision uses exact rational arithmetic; the response retains the unrounded change.
+If either period is below 30, its percentage and the comparison change are null.
+Raw counts, missing-test counts, demographic completeness and source coverage remain visible.
+
+The default four monitors cover urinary E. coli / CIP in PHC-S, PHC-N, ED and URO.
+The example [alerts.example.json](alerts.example.json) matches these defaults. Configure
+a fixed list of at most 32 monitors and a positive threshold up to 100 percentage
+points using `AEI_ALERT_CONFIG`; `minimum_tested` remains 30. Optional monitor fields
+are `sex`, `age_min`, `age_max` and `dedup_scope`; omitted/null ward means all wards.
+
+```powershell
+$env:AEI_ALERT_CONFIG = (Resolve-Path .\alerts.example.json).Path
+.\.venv\Scripts\python.exe -m uvicorn aei.api:create_app --factory --host 127.0.0.1 --port 8000
+```
+
+Configuration is **frozen for each run**, with a configuration hash in every report.
+Restart with the desired file and reset replay to apply a change to a new run.
+Existing run history is preserved. `{"monitors":[]}` disables monitors for a new run.
+Missing/invalid configuration files fail explicitly; duplicates and invalid thresholds
+are rejected. Unknown wards/organisms/drugs, screening drugs and incompatible specimen
+restrictions produce an explicit `unavailable` monitor with a reason, never a false alert.
+Threshold, baseline and monitor choices remain marked `proposed_pending_partner_confirmation`.
+
+Every run initialization and daily replay publication evaluates all monitors in the
+**same transaction** as the culture bundles, clock and revision, including empty dates.
+A detector failure rolls back the publication. An existing pre-alert run is adopted
+at its current date without inventing earlier monitoring history. Dashboard filters,
+ordinary reads and start/pause controls do not create monitors or advance the lifecycle.
+Legacy `/events` writes remain history-only and cannot trigger these run-based alerts.
+
+| Alert state | Meaning |
+| --- | --- |
+| `new` | First sufficient-data trigger in this run. |
+| `ongoing` | A later publication still triggers, including recurrence after clearance. |
+| `cleared` | Both denominators are sufficient and the increase is below threshold. |
+| `insufficient_evidence` | A tracked alert cannot be evaluated; retain `last_sufficient_state`. Low counts never clear it. |
+
+Before the first trigger, only monitor evaluation metadata exists. There is no
+invented cleared alert. One stable identity covers run/cohort/drug/rule, with first/last
+trigger dates and revisions. Transitions and all monitor evaluations are immutable.
+The mutable `alerts` table stores the latest lifecycle state; `alert_configurations`,
+`alert_batches`, `alert_evaluations`, `alert_transitions` and frozen analyses retain history.
+
+`/alerts` defaults to new, ongoing and insufficient-evidence alerts. Repeat `states`
+to request other lifecycle states, including cleared alerts in the active run. The
+response includes `run_id`, current `state_revision`, last `monitoring_revision`,
+`monitoring_as_of`, configuration, `alerts`, and `monitors`. Join an alert's `monitor_id`
+to `monitors[].context.monitor_id` for its cohort, drug, counts, change and latest
+evaluation status. `monitoring_revision` can lag the state revision after start/pause;
+the monitoring date and data remain unchanged. Unknown query filters, including
+`as_of`, are rejected. Hide the current alert list when a pinned dashboard reporting
+date differs from `monitoring_as_of`, and offer following the replay date.
+
+Each alert provides `investigation_url`, `investigation_id` and `original_analysis_id`.
+The investigation returns separately labeled `original_detection` (frozen),
+`current_analysis` (saved at the active revision), and lifecycle `transitions`.
+After reset, old investigations remain available with `current_analysis=null` and
+`current_analysis_status=archived_run`; they never borrow data from the new run.
+
+Investigation windows include eligible/tested/S/R/untested counts, raw isolates before
+deduplication/demographic filters, sex counts, age bins (0-17, 18-64, 65+), collection
+setting and missing metadata. These context counts describe eligible first isolates,
+including untested isolates. For inpatients, collection minus admission >=2 days is
+the hospital-day-3-or-later proxy; it does not establish infection origin. Counts
+separate earlier timing, unknown timing and outpatient not-applicable timing.
+Organism mix removes only the organism filter and has its own **count-only** population.
+It is not the monitored species' resistance denominator. Shared patient counts disclose
+recurrence between periods; no independence assumption is made.
+
+All monitor/current investigation snapshots use `alert-v1` saved analysis IDs and the
+existing JSON/CSV export routes. CSV produces baseline/recent `alert_window` rows with
+provenance, measurements and empty suppressed percentages; an unavailable monitor
+produces an `alert_unavailable` row. Export always reads the frozen analysis, including
+after replay/reset. Investigation envelopes can change as the active run advances;
+use the contained analysis ID for a reproducible export.
+
+### Separate authored alert demonstration
+
+The deterministic scenario generator creates a **new directory** with six valid CSVs
+and an explicit `SCENARIO.json` description. It refuses to overwrite any directory.
+Its patient identifiers and home-area values label it as authored synthetic data.
+Import it into its own schema/manifest; never substitute it for the supplied dataset.
+
+```powershell
+.\.venv\Scripts\python.exe -m aei.alert_scenario --output .data/alert-demo
+.\.venv\Scripts\python.exe -m aei --schema aei_alert_demo replay --dataset-dir .data/alert-demo --from-date 2026-09-27 --through 2026-10-01 --delay 0
+```
+
+At the 2026-09-26 seed there are 29 recent tests and no alert. On September 27 the
+ED / urinary E. coli / CIP monitor reaches 30 in both periods, rises from 20% to 30%
+resistance and creates one alert. September 28 becomes insufficient evidence,
+September 29 clears, and September 30 recurs as ongoing under the same ID. October 1
+adds only a negative culture and remains ongoing. Other default wards are explicitly
+unavailable in this small fixture. The complete lifecycle is tested against PostgreSQL.
 
 ### Patient specimen history
 
@@ -412,7 +532,7 @@ Invoke-RestMethod http://127.0.0.1:8000/api/v1/state
 `replay_runs` and `active_run` hold operational state. Append-only `run_cultures` and
 `run_isolates` store exact visible source versions and the revision that published
 each one. Append-only `saved_analyses` stores report payloads. Every step commits bundle
-membership, demo date and revision together. Reset never deletes source history or
+membership, demo date, revision and alert evaluations together. Reset never deletes source history or
 old reports. The metadata catalogs describe the full source, while evidence reads
 only exact event IDs published in the active run.
 
@@ -447,6 +567,10 @@ Comparison/history tests cover common-denominator suppression, all four S/R cell
 drug-order reversal, missing tests, screening exclusions, independent windows,
 strict history boundaries, negative specimens, repeated isolates, revision corrections,
 hidden future IDs, cursor isolation, concurrent reset and preserved exports.
+Alert tests cover disjoint calendar bounds, exact threshold arithmetic, counts at
+29/30, first-isolate and demographic rules, missing tests, timing/context counts,
+the full lifecycle, frozen configuration, archived investigations, schema upgrades,
+concurrent readers/steps, detector rollback, append-only history and saved exports.
 `python -m aei schema` prints the versioned input contract.
 
 The supplied-data check replayed all 28 days through 2026-09-27, ending with 46,792
@@ -454,7 +578,7 @@ cultures and 24,571 isolates. An independent SQL query matched the ED / E. coli 
 urine / CIP / female / age 65+ cohort: 15 tested (15 S, 0 R) in 28 days and 210 tested
 (199 S, 11 R) in 12 months. Reset reproduced the seed evidence and retained old
 JSON/CSV exports; the source archive and main event history were unchanged. On this
-development machine, publication of the 28 steps took about 3.5 seconds excluding
+development machine before alert evaluation was added, publication of the 28 steps took about 3.5 seconds excluding
 staging, an uncached evidence query 2.6 seconds, and a cached query 0.03 seconds.
 These are local smoke-check timings, not production throughput guarantees.
 
@@ -466,8 +590,20 @@ A selected patient's 18 prior cultures (9 negative/mixed) across nine pages matc
 the source specimens and every recorded AST result. Reset kept old history exports
 unchanged and hid future-only patient IDs. No source files or main event history changed.
 
-Still pending: alert rules and investigation, external complete-bundle publication,
-Flink, live notifications and the dashboard. Evidence, antibiotic comparison and patient
-history API views with saved exports are implemented. Calculations load published
+Still pending: partner confirmation of the proposed alert configuration and detailed
+counting policies, external complete-bundle publication, Flink, live notifications
+and the dashboard. Evidence, antibiotic comparison, patient history, alerts and
+investigation API views with saved exports are implemented. Calculations load published
 events in memory and serialize with replay publication; this is a correctness reference, not a
 production throughput claim. See [the Flink integration boundary](flink/README.md).
+
+The alert upgrade passed **147 tests**, including 30 alert/scenario tests and real
+PostgreSQL integration tests. A separate supplied-data check matched independent SQL
+for all four monitors on 2026-09-27 (urinary E. coli / CIP): ED baseline/recent tested
+624/45, URO 338/33, PHC-N 611/67 and PHC-S 620/74, including exact S/R counts and changes.
+All four were below the 10-point threshold on that date. Three subsequent replay
+steps from a September 24 seed kept monitoring and publication revisions aligned;
+frozen exports, the source archive and existing main event history remained unchanged.
+With four monitors, that local check took about 22 seconds for initial full publication
+and 19 seconds for three daily steps. These timings include full in-memory snapshots
+and shared database locking; they are not a live-feed latency guarantee.
