@@ -7,11 +7,12 @@ from itertools import groupby
 from pathlib import Path
 
 from .config import database_url
-from .dataset import DEFAULT_DATASET, load_dataset
+from .dataset import DatasetValidationError, default_dataset, load_bundle, load_dataset
 from .migration import read_sqlite_history
 from .models import AnalysisQuery, IsolateEvent
 from .postgres import PostgresEventStore
 from .processor import ReferenceProcessor, compare_periods
+from .store import EventConflict
 
 
 def main():
@@ -20,9 +21,18 @@ def main():
     parser.add_argument("--schema", default="aei", help="PostgreSQL schema; use a separate schema for replay")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    importer = commands.add_parser("import-dataset", help="Import the synthetic archive without extracting it")
-    importer.add_argument("--zip", default=str(DEFAULT_DATASET))
+    def add_source(command):
+        sources = command.add_mutually_exclusive_group()
+        sources.add_argument("--zip", type=Path, help="Synthetic ZIP archive")
+        sources.add_argument("--dataset-dir", type=Path, help="Directory containing the six source CSVs")
+
+    importer = commands.add_parser("import-dataset", help="Validate and atomically import source cultures and metadata")
+    add_source(importer)
     importer.add_argument("--through", type=date.fromisoformat)
+    importer.add_argument("--report", type=Path, help="Write the validation and import result as JSON")
+    validator = commands.add_parser("validate-dataset", help="Validate source files without connecting to a database")
+    add_source(validator)
+    validator.add_argument("--report", type=Path, help="Write the validation report as JSON")
 
     def add_filters(command):
         command.add_argument("--as-of", type=date.fromisoformat, required=True)
@@ -43,7 +53,7 @@ def main():
     migration.add_argument("--sqlite", type=Path, required=True)
 
     replay = commands.add_parser("replay", help="Replay daily batches and recalculate, including empty days")
-    replay.add_argument("--zip", default=str(DEFAULT_DATASET))
+    add_source(replay)
     replay.add_argument("--from-date", type=date.fromisoformat, required=True)
     replay.add_argument("--through", type=date.fromisoformat, required=True)
     replay.add_argument("--delay", type=float, default=0.2, help="Seconds between simulated days")
@@ -52,6 +62,39 @@ def main():
 
     if args.command == "schema":
         print(json.dumps(IsolateEvent.model_json_schema(), indent=2))
+        return
+
+    if args.command in ("import-dataset", "validate-dataset", "replay"):
+        if args.dataset_dir is not None and not args.dataset_dir.is_dir():
+            parser.error("--dataset-dir must name an existing directory")
+        if args.zip is not None and not args.zip.is_file():
+            parser.error("--zip must name an existing archive")
+        source = args.zip or args.dataset_dir or default_dataset()
+
+    if args.command in ("import-dataset", "validate-dataset"):
+        def emit_report(value):
+            output = json.dumps(value, indent=2, ensure_ascii=False)
+            if args.report:
+                args.report.parent.mkdir(parents=True, exist_ok=True)
+                args.report.write_text(output + "\n", encoding="utf-8")
+            print(output)
+
+        try:
+            bundle = load_bundle(source)
+        except DatasetValidationError as error:
+            emit_report(error.report.model_dump(mode="json"))
+            raise SystemExit(2) from error
+        if args.command == "validate-dataset":
+            emit_report(bundle.report.model_dump(mode="json"))
+        else:
+            store = PostgresEventStore(args.database_url, schema=args.schema)
+            try:
+                result = store.import_dataset(bundle, args.through)
+            except EventConflict as error:
+                emit_report({"validation": bundle.report.model_dump(mode="json"),
+                             "error": {"code": "import_conflict", "message": str(error)}})
+                raise SystemExit(2) from error
+            emit_report({**result, "validation": bundle.report.model_dump(mode="json")})
         return
 
     store = PostgresEventStore(args.database_url, schema=args.schema)
@@ -63,12 +106,6 @@ def main():
         inserted, duplicates = store.append_many(events)
         print(json.dumps({"source_events": len(events), "inserted": inserted,
                           "duplicates": duplicates, "total_events": store.count()}))
-    elif args.command == "import-dataset":
-        events = load_dataset(args.zip)
-        if args.through:
-            events = [event for event in events if event.sample_date <= args.through]
-        inserted, duplicates = store.append_many(events)
-        print(json.dumps({"inserted": inserted, "duplicates": duplicates, "total_events": store.count()}))
     elif args.command in ("stats", "compare"):
         query = AnalysisQuery(**{key: value for key, value in vars(args).items()
                                  if key in AnalysisQuery.model_fields and value is not None})
@@ -80,7 +117,7 @@ def main():
             parser.error("Replay needs from-date <= through and a nonnegative delay")
         if store.count():
             parser.error("Replay requires an empty event table; use --schema with a new replay schema")
-        events = load_dataset(args.zip)
+        events = load_dataset(source)
         store.append_many(event for event in events if event.sample_date < args.from_date)
         by_day = {day: list(batch) for day, batch in groupby(events, key=lambda event: event.sample_date)}
         day = args.from_date

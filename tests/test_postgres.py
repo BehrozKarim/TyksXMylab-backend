@@ -12,10 +12,13 @@ from fastapi.testclient import TestClient
 from psycopg import sql
 
 from aei.api import create_app
+from aei.dataset import load_bundle
+from aei.dataset_store import SOURCE_TABLES
 from aei.migration import read_sqlite_history
 from aei.postgres import PostgresEventStore
 from aei.store import EventConflict, SQLiteEventStore
 from test_pipeline import event
+from test_import import fixture_tables, write_fixture
 
 
 @unittest.skipUnless(os.environ.get("AEI_TEST_DATABASE_URL"), "Set AEI_TEST_DATABASE_URL for PostgreSQL tests")
@@ -56,10 +59,14 @@ class PostgresTests(unittest.TestCase):
     def test_event_history_rejects_update_delete_and_truncate(self):
         self.store.append_many([event()])
         for statement in ("UPDATE isolate_events SET revision=2", "DELETE FROM isolate_events",
-                          "TRUNCATE isolate_events"):
+                          "TRUNCATE isolate_events CASCADE"):
             with self.assertRaises(psycopg.errors.CheckViolation):
                 with self.store.connection() as db:
                     db.execute(statement)
+        # The new enrichment FK also blocks an unqualified TRUNCATE before triggers run.
+        with self.assertRaises(psycopg.errors.FeatureNotSupported):
+            with self.store.connection() as db:
+                db.execute("TRUNCATE isolate_events")
         self.assertEqual(self.store.count(), 1)
 
     def test_concurrent_identical_deliveries_are_counted_once(self):
@@ -92,3 +99,105 @@ class PostgresTests(unittest.TestCase):
             for period in ("rolling_28_days", "rolling_12_months"):
                 self.assertEqual(result.json()[period]["rows"][0]["resistance_percent"], 20)
             self.assertEqual(client.get("/isolates/0/history").status_code, 200)
+
+    def fixture_bundle(self, tables=None):
+        with tempfile.TemporaryDirectory() as folder:
+            return load_bundle(write_fixture(folder, tables))
+
+    def table_counts(self):
+        with self.store.connection() as db:
+            return {table: db.execute(sql.SQL("SELECT COUNT(*) FROM {}").format(
+                sql.Identifier(table))).fetchone()[0] for table in SOURCE_TABLES}
+
+    def test_complete_import_is_retry_safe_and_keeps_cultures_and_metadata(self):
+        bundle = self.fixture_bundle()
+        first = self.store.import_dataset(bundle)
+        second = self.store.import_dataset(bundle)
+        self.assertEqual((first["inserted"], first["duplicates"]), (2, 0))
+        self.assertEqual((second["inserted"], second["duplicates"]), (0, 2))
+        self.assertTrue(all(item["inserted"] == 0 for item in second["tables"].values()))
+        self.assertEqual(self.table_counts(), dict(dataset_manifests=1, patients=1, wards=2,
+                                                   antibiotics=2, culture_events=4, isolate_enrichments=2))
+        with self.store.connection() as db:
+            self.assertEqual(db.execute("SELECT payload->>'result' FROM culture_events WHERE culture_id='c2'").fetchone()[0], "negative")
+            self.assertEqual(db.execute("SELECT payload->>'result' FROM culture_events WHERE culture_id='c3'").fetchone()[0], "mixed_growth")
+            self.assertEqual(db.execute("SELECT payload->>'sex' FROM isolate_enrichments WHERE event_id='synthetic:i1:1'").fetchone()[0], "F")
+            self.assertTrue(db.execute("SELECT (payload->>'is_screening')::boolean FROM antibiotics WHERE antibiotic_code='FOX'").fetchone()[0])
+        self.assertEqual([e.canonical_json() for e in self.store.events()],
+                         [e.canonical_json() for e in bundle.events])
+
+    def test_enrichment_attaches_to_existing_exact_revision_without_rewriting_events(self):
+        bundle = self.fixture_bundle()
+        self.store.append_many(bundle.events)
+        original = bundle.events[0]
+        correction = original.model_copy(update={"event_id": "correction:i1:2", "revision": 2})
+        self.store.append_many([correction])
+        before = [e.canonical_json() for e in self.store.events()]
+        result = self.store.import_dataset(bundle)
+        self.assertEqual(result["inserted"], 0)
+        self.assertEqual([e.canonical_json() for e in self.store.events()], before)
+        with self.store.connection() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM isolate_enrichments WHERE event_id=%s",
+                                        (correction.event_id,)).fetchone()[0], 0)
+
+    def test_conflicting_existing_event_rolls_back_every_source_table(self):
+        bundle = self.fixture_bundle()
+        original = bundle.events[0]
+        changed = original.model_copy(update={"tests": (original.tests[0].model_copy(update={"result": "R"}),)})
+        self.store.append_many([changed])
+        with self.assertRaises(EventConflict):
+            self.store.import_dataset(bundle)
+        self.assertEqual(self.store.count(), 1)
+        self.assertEqual(self.store.events()[0].canonical_json(), changed.canonical_json())
+        self.assertTrue(all(value == 0 for value in self.table_counts().values()))
+
+    def test_failure_during_enrichment_rolls_back_events_cultures_and_manifest(self):
+        with self.store.connection() as db:
+            db.execute("""CREATE FUNCTION reject_test_enrichment() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN RAISE EXCEPTION 'Injected late failure' USING ERRCODE = '23514'; END; $$""")
+            db.execute("""CREATE TRIGGER fail_import BEFORE INSERT ON isolate_enrichments
+                FOR EACH STATEMENT EXECUTE FUNCTION reject_test_enrichment()""")
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            self.store.import_dataset(self.fixture_bundle())
+        self.assertEqual(self.store.count(), 0)
+        self.assertTrue(all(value == 0 for value in self.table_counts().values()))
+
+    def test_different_source_manifest_requires_separate_schema(self):
+        self.store.import_dataset(self.fixture_bundle())
+        before = self.table_counts()
+        tables = fixture_tables()
+        tables["patients.csv"][0]["home_area"] = "Changed"
+        with self.assertRaisesRegex(EventConflict, "separate --schema"):
+            self.store.import_dataset(self.fixture_bundle(tables))
+        self.assertEqual(self.table_counts(), before)
+        with self.store.connection() as db:
+            self.assertEqual(db.execute("SELECT payload->>'home_area' FROM patients").fetchone()[0], "Centre")
+
+    def test_partial_import_can_extend_without_republishing_existing_records(self):
+        from datetime import date
+        bundle = self.fixture_bundle()
+        initial = self.store.import_dataset(bundle, through=date(2026, 9, 26))
+        self.assertEqual(initial["inserted"], 1)
+        self.assertEqual(self.table_counts()["culture_events"], 3)
+        complete = self.store.import_dataset(bundle)
+        self.assertEqual((complete["inserted"], complete["duplicates"]), (1, 1))
+        self.assertEqual(complete["tables"]["culture_events"], {"inserted": 1, "duplicates": 3})
+        self.assertEqual(self.table_counts()["isolate_enrichments"], 2)
+
+    def test_concurrent_source_imports_publish_only_one_copy(self):
+        bundle = self.fixture_bundle()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: self.store.import_dataset(bundle), range(2)))
+        self.assertEqual(sum(result["inserted"] for result in results), 2)
+        self.assertEqual(sum(result["duplicates"] for result in results), 2)
+        self.assertEqual(self.table_counts()["culture_events"], 4)
+
+    def test_source_history_rejects_update_delete_and_truncate(self):
+        self.store.import_dataset(self.fixture_bundle())
+        for table in SOURCE_TABLES:
+            for template in ("UPDATE {} SET payload='{}'::jsonb", "DELETE FROM {}", "TRUNCATE {} CASCADE"):
+                with self.subTest(table=table, statement=template), self.assertRaises(psycopg.errors.CheckViolation):
+                    with self.store.connection() as db:
+                        statement = (sql.SQL("UPDATE {} SET payload=%s").format(sql.Identifier(table))
+                                     if template.startswith("UPDATE") else sql.SQL(template).format(sql.Identifier(table)))
+                        db.execute(statement, (psycopg.types.json.Jsonb({}),) if template.startswith("UPDATE") else None)

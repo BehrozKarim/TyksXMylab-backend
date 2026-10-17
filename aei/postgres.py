@@ -9,6 +9,7 @@ import psycopg
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
+from .dataset_store import import_bundle, initialize_dataset_tables
 from .models import IsolateEvent
 from .store import EventConflict
 
@@ -45,6 +46,7 @@ class PostgresEventStore:
             db.execute("""CREATE OR REPLACE TRIGGER forbid_event_mutation
                 BEFORE UPDATE OR DELETE OR TRUNCATE ON isolate_events
                 FOR EACH STATEMENT EXECUTE FUNCTION reject_event_mutation()""")
+            initialize_dataset_tables(db)
 
     @contextmanager
     def connection(self):
@@ -52,7 +54,15 @@ class PostgresEventStore:
                              options=f"-c search_path={self.schema},pg_catalog") as db:
             yield db
 
+    def import_dataset(self, bundle, through=None):
+        return import_bundle(self, bundle, through)
+
     def append_many(self, events: Iterable[IsolateEvent]) -> tuple[int, int]:
+        with self.connection() as db:
+            return self.append_many_in_transaction(db, events)
+
+    def append_many_in_transaction(self, db, events: Iterable[IsolateEvent]) -> tuple[int, int]:
+        """Caller owns the transaction and must let errors roll back the entire batch."""
         # Validate duplicate identities inside the incoming batch before using COPY.
         submitted = 0
         unique = {}
@@ -70,28 +80,27 @@ class PostgresEventStore:
         if not submitted:
             return 0, 0
 
-        with self.connection() as db:
-            db.execute("""CREATE TEMPORARY TABLE incoming_events (
-                event_id TEXT, isolate_id TEXT, revision INTEGER, patient_id TEXT,
-                sample_date DATE, received_at TIMESTAMPTZ, payload JSONB
-            ) ON COMMIT DROP""")
-            with db.cursor().copy("COPY incoming_events FROM STDIN") as copy:
-                for event, payload in unique.values():
-                    copy.write_row((event.event_id, event.isolate_id, event.revision,
-                                    event.patient_id, event.sample_date, event.received_at, Jsonb(payload)))
-            # Conflict checking happens after insertion in the same transaction, which
-            # also handles another writer inserting the same ID concurrently.
-            inserted = db.execute("""INSERT INTO isolate_events
-                (event_id, isolate_id, revision, patient_id, sample_date, received_at, payload)
-                SELECT event_id, isolate_id, revision, patient_id, sample_date, received_at, payload
-                FROM incoming_events ORDER BY event_id
-                ON CONFLICT DO NOTHING""").rowcount
-            conflict = db.execute("""SELECT 1 FROM incoming_events incoming
-                LEFT JOIN isolate_events stored USING (event_id)
-                WHERE stored.event_id IS NULL OR stored.payload IS DISTINCT FROM incoming.payload
-                LIMIT 1""").fetchone()
-            if conflict:
-                raise EventConflict("Event ID or isolate revision already exists with different data")
+        db.execute("""CREATE TEMPORARY TABLE incoming_events (
+            event_id TEXT, isolate_id TEXT, revision INTEGER, patient_id TEXT,
+            sample_date DATE, received_at TIMESTAMPTZ, payload JSONB
+        ) ON COMMIT DROP""")
+        with db.cursor().copy("COPY incoming_events FROM STDIN") as copy:
+            for event, payload in unique.values():
+                copy.write_row((event.event_id, event.isolate_id, event.revision,
+                                event.patient_id, event.sample_date, event.received_at, Jsonb(payload)))
+        # Conflict checking happens after insertion in the same transaction, which
+        # also handles another writer inserting the same ID concurrently.
+        inserted = db.execute("""INSERT INTO isolate_events
+            (event_id, isolate_id, revision, patient_id, sample_date, received_at, payload)
+            SELECT event_id, isolate_id, revision, patient_id, sample_date, received_at, payload
+            FROM incoming_events ORDER BY event_id
+            ON CONFLICT DO NOTHING""").rowcount
+        conflict = db.execute("""SELECT 1 FROM incoming_events incoming
+            LEFT JOIN isolate_events stored USING (event_id)
+            WHERE stored.event_id IS NULL OR stored.payload IS DISTINCT FROM incoming.payload
+            LIMIT 1""").fetchone()
+        if conflict:
+            raise EventConflict("Event ID or isolate revision already exists with different data")
         return inserted, submitted - inserted
 
     def events(self, isolate_id: str | None = None) -> list[IsolateEvent]:

@@ -2,6 +2,15 @@
 
 Status: implementation plan for extending the runnable reference prototype at commit `b54015f` (`Move prototype contents to repository root`). Existing capabilities below describe inspected code; the `/api/v1` contract describes planned additions that the frontend must follow.
 
+Development update: the current backend uses Docker PostgreSQL and `prototype-v2`
+with rolling 28-day and rolling 12-month reports. The first importer/storage upgrade
+now supports validated ZIP/CSV-folder imports, source manifests, complete cultures
+and revision-bound enrichment in one PostgreSQL transaction. See [README](README.md)
+for current commands and limitations. The SQLite, missing-ZIP and `prototype-v1`
+references below describe the original planning baseline. Additional report windows,
+changed counting policies, `/api/v1`, replay controls, alerts and Flink remain proposals
+or later work; they are not implemented by this importer/storage milestone.
+
 Build a ward antibiotic evidence assistant that updates as synthetic laboratory records arrive. Its main outputs are susceptibility evidence across calendar annual, rolling 12-month and 28-day windows, an A/B laboratory comparison, specimen history, and automatically detected changes that a researcher can investigate.
 
 ## 1. Current repository and delivery boundary

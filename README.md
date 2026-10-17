@@ -1,6 +1,6 @@
 # Tyks AEI backend
 
-Current flow: **CSV archive or API -> append-only PostgreSQL event history -> Python
+Current flow: **CSV archive/folder or API -> append-only PostgreSQL event history -> Python
 reference processor -> JSON statistics**. PostgreSQL runs in Docker with a persistent
 volume. Annual results now mean **rolling last 12 calendar months**, alongside the
 rolling last 28 days. Flink, alerts and a dashboard are not active yet.
@@ -29,15 +29,24 @@ no Flink replication slot or job is created yet.
 
 ## Load data or migrate SQLite history
 
-The supplied synthetic ZIP is not committed to Git. By default it is expected
-beside the project directory. Set `AEI_DATASET_PATH` or pass `--zip` if elsewhere.
+The supplied data is not committed to Git. Explicit `--zip` or `--dataset-dir`
+selects the source. Otherwise `AEI_DATASET_PATH` takes precedence, followed by
+the ZIP beside this project, then `synthetic_microbiology_dataset/` in this project.
+An explicit missing source fails rather than silently selecting another dataset.
 
 ```powershell
 # Existing prototype users: preserve every recorded revision from SQLite.
 .\.venv\Scripts\python.exe -m aei migrate-sqlite --sqlite .data/aei.sqlite3
 
-# Fresh installations: import the supplied archive instead.
-.\.venv\Scripts\python.exe -m aei import-dataset --zip ../synthetic_microbiology_dataset.zip
+# Validate all six CSV files without connecting to PostgreSQL.
+.\.venv\Scripts\python.exe -m aei validate-dataset --zip ../synthetic_microbiology_dataset.zip --report .data/validation.json
+
+# Import cultures, metadata and isolate events in one transaction.
+# Also works after a previous isolate-only import: existing events are preserved.
+.\.venv\Scripts\python.exe -m aei import-dataset --zip ../synthetic_microbiology_dataset.zip --report .data/import.json
+
+# Alternative source: a directory containing the same six CSV files.
+.\.venv\Scripts\python.exe -m aei validate-dataset --dataset-dir synthetic_microbiology_dataset
 
 # API documentation: http://127.0.0.1:8000/docs
 .\.venv\Scripts\python.exe -m uvicorn aei.api:create_app --factory --host 127.0.0.1 --port 8000
@@ -47,6 +56,49 @@ Migration opens SQLite read-only and retains every event ID, revision and payloa
 Import/migration can be repeated safely: identical events are ignored; conflicts
 roll back the entire batch. SQLite is retained only for migration and isolated unit
 tests. The running backend uses PostgreSQL with no automatic SQLite fallback.
+
+### Source validation and additional storage
+
+Both sources require `patients.csv`, `wards.csv`, `antibiotics.csv`, `cultures.csv`,
+`isolates.csv` and `susceptibility.csv`, with the supplied headers and comma-delimited
+UTF-8 (optional BOM). Dates accept only `YYYY-MM-DD` or `DD-MM-YY`; short years mean
+2000-2099. IDs remain strings, including leading zeros. Source files are never rewritten.
+
+Validation rejects duplicate IDs/AST pairs, missing links, dictionary mismatches,
+invalid values, contradictory culture/isolate counts, incorrect ISO weeks and
+admissions after sampling. Errors identify code, file, CSV line and record ID;
+the report retains the first 100 errors and the total error count. Validation
+failures exit with status 2 before opening a database connection. Missing AST is
+allowed and reported; no antibiotic outcome is inferred from a phenotype.
+
+Each manifest records source-file SHA-256 hashes, row counts, observed culture-date
+bounds, observed organism/specimen/drug panels and importer version. Warnings identify
+the synthetic receipt-time convention and the supplied README's omitted-pair discrepancy.
+Observed date bounds describe file contents, not proof of a complete live laboratory feed.
+
+PostgreSQL adds these immutable tables alongside the unchanged isolate event payloads:
+
+| Table | Stored information |
+| --- | --- |
+| `dataset_manifests` | Source identity, validation provenance and first import timestamp. |
+| `patients` | Sex, birth year and home area. |
+| `wards`, `antibiotics` | Source dictionaries, including drug screening labels. |
+| `culture_events` | Every culture, including negative/mixed cultures with no isolates. |
+| `isolate_enrichments` | Demographics, age at sampling, admission date, quantity and phenotype flags attached to the exact isolate event revision. |
+
+All source records, cultures, isolate events and enrichments commit together. Conflicts
+or a failure in any part roll back the complete import. Repeated imports of identical
+files are safe, including a ZIP and directory containing identical bytes. One manifest
+is allowed per PostgreSQL schema: a changed source or separate scenario requires a
+separate `--schema`. Equivalent CSVs re-encoded with different dates have different
+source hashes and therefore also require a separate schema. An external corrected
+isolate revision receives no metadata from an older revision automatically.
+
+`import-dataset --through YYYY-MM-DD` imports complete cultures and their isolates
+through that inclusive date. Repeating the same source with a later cutoff extends
+the import. Dictionaries/patients and the manifest describe the whole source, while
+the returned per-table counts describe the selected import. This is not run-based
+replay visibility or a patient-history API; those remain later development steps.
 
 ## Reports and API
 
@@ -120,12 +172,14 @@ Use a separate empty PostgreSQL schema to preserve the main event history:
 
 The driver loads earlier events, then advances daily, including days without new
 results, and prints recalculation summaries. It is a simulation, not a live lab
-feed. Use another empty replay schema when repeating the demonstration.
+feed. Use another empty replay schema when repeating the demonstration. This existing
+driver still replays isolate events only; culture-bundle publication and HTTP replay
+controls are a later stage. It also accepts `--dataset-dir`.
 
 ## Verify
 
 ```powershell
-# Unit/API/reference tests; dataset test skips if the supplied ZIP is absent.
+# Unit/API/reference tests; supplied-data test skips if the source is absent.
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 
 # Include real PostgreSQL integration tests in disposable aei_test_* schemas.
@@ -136,6 +190,8 @@ $env:AEI_TEST_DATABASE_URL = 'postgresql://aei:aei_local_only@127.0.0.1:55432/ae
 Tests cover leap years, independent period selection, missing tests, the 29/30
 threshold, corrections, knowledge cutoffs, atomic conflicts, concurrent retries,
 append-only history, read-only SQLite migration, API behavior and the supplied data.
+Importer tests additionally cover ZIP/folder equivalence, short dates, validation,
+negative cultures, metadata revisions, concurrent imports and complete rollback.
 `python -m aei schema` prints the versioned input contract.
 
 Still pending: Flink processing, persisted result/alert history, alert definitions,
