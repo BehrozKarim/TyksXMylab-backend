@@ -47,14 +47,16 @@ def coverage_for(snapshot: EvidenceSnapshot, start, end) -> SourceCoverage:
         overlap_start = overlap_end = None
     expected_cultures = manifest.files["cultures.csv"].rows
     expected_isolates = manifest.files["isolates.csv"].rows
+    imported_enrichments = (len(snapshot.enrichments) if snapshot.imported_enrichments is None
+                           else snapshot.imported_enrichments)
     return SourceCoverage(
         source_start=source_start, source_end=source_end, overlap_start=overlap_start, overlap_end=overlap_end,
         source_date_span_covers_window=bool(source_start and source_end and source_start <= start and end <= source_end),
         imported_culture_start=snapshot.imported_culture_start, imported_culture_end=snapshot.imported_culture_end,
         source_fully_imported=(snapshot.imported_cultures == expected_cultures
-                               and len(snapshot.enrichments) == expected_isolates),
+                               and imported_enrichments == expected_isolates),
         source_cultures_expected=expected_cultures, source_cultures_imported=snapshot.imported_cultures,
-        source_isolates_expected=expected_isolates, source_isolates_enriched=len(snapshot.enrichments))
+        source_isolates_expected=expected_isolates, source_isolates_enriched=imported_enrichments)
 
 
 def calculate_evidence(snapshot: EvidenceSnapshot, query: EvidenceQuery) -> EvidenceReport:

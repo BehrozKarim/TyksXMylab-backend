@@ -25,8 +25,9 @@ class EvidenceQuery(StrictModel):
         if self.age_min is not None and self.age_max is not None and self.age_min > self.age_max:
             raise ValueError("age_min cannot exceed age_max")
         # Reuse the established date conventions and supported-date checks.
-        for period in ("rolling_28_days", "rolling_12_months"):
-            AnalysisQuery(as_of=self.as_of, period=period)
+        if self.as_of is not None:  # The HTTP request resolves an omitted date from its run.
+            for period in ("rolling_28_days", "rolling_12_months"):
+                AnalysisQuery(as_of=self.as_of, period=period)
         return self
 
 

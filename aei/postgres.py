@@ -12,6 +12,7 @@ from psycopg.types.json import Jsonb
 from .dataset_store import import_bundle, initialize_dataset_tables
 from .evidence_source import read_evidence_snapshot
 from .models import IsolateEvent
+from .publication_store import initialize_publication_tables
 from .store import EventConflict
 
 
@@ -48,6 +49,7 @@ class PostgresEventStore:
                 BEFORE UPDATE OR DELETE OR TRUNCATE ON isolate_events
                 FOR EACH STATEMENT EXECUTE FUNCTION reject_event_mutation()""")
             initialize_dataset_tables(db)
+            initialize_publication_tables(db)
 
     @contextmanager
     def connection(self):

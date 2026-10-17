@@ -1,7 +1,9 @@
 # Tyks AEI backend
 
-Current flow: **CSV archive/folder or API -> append-only PostgreSQL event history -> Python
-reference processor -> JSON statistics**. PostgreSQL runs in Docker with a persistent
+Current flow: **CSV archive/folder -> validated source bundles in PostgreSQL -> published
+replay run -> Python reference processor -> saved evidence and JSON/CSV exports**.
+The original event-ingestion and statistics endpoints also remain available.
+PostgreSQL runs in Docker with a persistent
 volume. Annual results now mean **rolling last 12 calendar months**, alongside the
 rolling last 28 days. Flink, alerts and a dashboard are not active yet.
 
@@ -97,8 +99,10 @@ isolate revision receives no metadata from an older revision automatically.
 `import-dataset --through YYYY-MM-DD` imports complete cultures and their isolates
 through that inclusive date. Repeating the same source with a later cutoff extends
 the import. Dictionaries/patients and the manifest describe the whole source, while
-the returned per-table counts describe the selected import. This is not run-based
-replay visibility or a patient-history API; those remain later development steps.
+the returned per-table counts describe the selected import. Source staging and replay
+visibility are separate: a later import does not silently change an existing run.
+Complete the import, then reset replay to publish a new view. A patient-history API
+remains later work.
 
 ## Reports and API
 
@@ -115,12 +119,20 @@ replay visibility or a patient-history API; those remain later development steps
 - `GET /statistics?as_of=2026-09-27&period=rolling_12_months`: latest 12 months.
 - `GET /statistics/comparison?as_of=2026-09-27`: both periods from one source snapshot.
 - `GET /api/v1/evidence`: enriched evidence for one organism, specimen and antibiotic,
-  with both periods, demographic filters, confidence intervals and source coverage.
+  with both periods, demographic filters, confidence intervals and source coverage;
+  returns a saved `analysis_id` and its run/revision.
+- `GET /api/v1/meta`: filter dictionaries, observed panels, screening labels, supported
+  periods, source bounds, defaults and limitations.
+- `GET /api/v1/state`: active run, revision, demo date and published culture/isolate counts.
+- `GET /api/v1/analyses/{analysis_id}`: retrieve the original saved response.
+- `GET /api/v1/analyses/{analysis_id}/export?format=json|csv`: download that response.
+- `POST /api/v1/replay/reset|start|pause|step`: control the synthetic replay.
 
 Filters: `ward_code`, `organism`, `specimen`, `antibiotic_code`, `dedup_scope`.
 `known_at` optionally restricts results to revisions received by that timestamp.
 `as_of` controls sample dates, not knowledge time. Without `known_at`, the latest
-known revisions are used. No system date is selected implicitly.
+known revisions are used. Legacy statistics require an explicit `as_of`; published
+evidence defaults to the run's demo date. Neither uses the computer's date implicitly.
 
 ### Enriched evidence
 
@@ -138,13 +150,15 @@ Equivalent HTTP request:
 GET /api/v1/evidence?as_of=2026-09-27&ward_code=ED&organism=Escherichia%20coli&specimen=urine&antibiotic_code=CIP&sex=F&age_min=65
 ```
 
-Required inputs are `as_of`, `organism`, `specimen` and `antibiotic_code`. Optional
+Required inputs are `organism`, `specimen` and `antibiotic_code`. Optional
 filters are `ward_code`, `sex`, inclusive `age_min`/`age_max`, `dedup_scope`, and
-`known_at`. Unknown codes, missing required inputs, invalid dates and inverted age
+`known_at`. Optional `as_of` defaults to the published demo date and cannot exceed it.
+Unknown codes, missing required inputs, invalid dates and inverted age
 ranges return HTTP 422. A missing validated dataset/unsupported store returns 503.
-There is no implicit reporting date until a replay clock is implemented.
+On first use, a completed run exposes the complete culture bundles already imported,
+through their latest sample date. Use reset to start a replay from an earlier cutoff.
 
-Each response returns `context` and `windows.rolling_28_days` / `rolling_12_months`:
+Each response returns `analysis_id`, `context` and `windows.rolling_28_days` / `rolling_12_months`:
 
 - Revision resolution and first-isolate selection are shared with the existing
   reference processor. Each period selects independently. The default ward policy
@@ -187,10 +201,36 @@ Coverage separates the source's observed date span from how much has been import
   These flags describe source files and database contents, not proof of real feed
   completeness. They remain independent of the 30-isolate threshold and `known_at`.
 
-Both windows, metadata, dictionaries and coverage are read from one PostgreSQL
-repeatable-read snapshot, even while another request ingests new events. Responses
-are computed on demand; they are not saved analyses and have no replay run/revision
-or export ID yet. Other `/api/v1` routes in the implementation plan remain future work.
+Published evidence separates physical source coverage from run visibility:
+`context.published_cultures`, `published_isolates`, `demo_date` and
+`latest_visible_sample_date` describe the visible run. A fully staged source can
+still have most records hidden during replay. Counts in `coverage` describe the
+physical import at analysis creation, not a claim that future samples were included.
+
+Both windows are calculated under the same PostgreSQL publication/import lock and
+saved before that lock is released. Reports contain the exact run/revision, normalized
+filters, method/importer versions and source-file SHA-256 hashes. Repeating the same
+query at the same run/revision reuses its saved report; omitted defaults and equivalent
+knowledge-time offsets normalize identically. Steps (including empty days), start and
+pause change the revision; reset creates a new run. Old reports and exports never change.
+No source patient identifiers appear in aggregate exports.
+
+JSON exports contain the saved document. CSV exports contain two rows, one per period,
+with flattened dotted field names for context, filters, provenance, coverage and interval
+bounds. Suppressed percentages/intervals are empty; counts and status are retained.
+Spreadsheet formula prefixes in source labels are escaped with a leading apostrophe.
+
+For coordinated reads, send `expected_run_id` and `expected_revision` together, using
+`/api/v1/state`. Evidence accepts them as query parameters; replay controls accept them
+in the JSON body. A mismatch returns HTTP 409 with `error.details.state` and creates
+no analysis. Omitting both uses whichever state is current when the request acquires
+the lock. Clients may poll state every two seconds; push notifications are not implemented.
+
+Versioned errors consistently use
+`{"error":{"code":"...","message":"...","details":{}},"request_id":"..."}`,
+with the same ID in `X-Request-ID`. Legacy routes retain their original error shapes.
+Set `AEI_CORS_ORIGINS` to a comma-separated list of allowed frontend origins; defaults
+are `http://localhost:3000` and `http://127.0.0.1:3000`.
 
 ### Rolling-year definition
 
@@ -236,17 +276,57 @@ sample date as an explicit synthetic arrival convention**.
 
 ## Replay
 
-Use a separate empty PostgreSQL schema to preserve the main event history:
+Use a separate PostgreSQL schema to keep demo state independent of the main run:
 
 ```powershell
 .\.venv\Scripts\python.exe -m aei --schema aei_replay replay --from-date 2026-08-31 --through 2026-09-27 --delay 0.2
 ```
 
-The driver loads earlier events, then advances daily, including days without new
-results, and prints recalculation summaries. It is a simulation, not a live lab
-feed. Use another empty replay schema when repeating the demonstration. This existing
-driver still replays isolate events only; culture-bundle publication and HTTP replay
-controls are a later stage. It also accepts `--dataset-dir`.
+The driver validates and stages the complete source, creates a new run seeded through
+the day before `--from-date`, then publishes complete daily bundles. It prints state,
+new-culture and new-isolate counts. Negative/mixed cultures and days without arrivals
+still advance the clock. It accepts `--dataset-dir` too, and can be repeated in the
+same schema: old source events and saved analyses remain intact. CLI `evidence` and
+HTTP evidence use the same publication/snapshot service; `python -m aei state` shows
+the active run. Legacy `stats`/`compare` intentionally read the full event history.
+
+For HTTP replay, import the full source and run the API with lifespan enabled (the
+documented Uvicorn command does this by default):
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/replay/reset -Method Post -ContentType application/json -Body '{"seed_through":"2026-08-30","replay_through":"2026-09-27"}'
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/replay/step -Method Post
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/replay/start -Method Post -ContentType application/json -Body '{"interval_seconds":1}'
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/replay/pause -Method Post
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/state
+```
+
+- `reset` requires a complete source import. Without dates it seeds 28 days before
+  source end (clamped to source start minus one day), then replays through source end.
+  An explicit end must lie within the source span, and seed cannot exceed it.
+- `step` requires `paused` and advances exactly one date. Concurrent publication or
+  analysis can return 409 `publication_busy`; refresh state and retry. Send expected
+  state tokens to prevent a duplicate UI request from advancing a second day.
+- `start` resumes a paused run. Repeated starts while running keep the existing schedule.
+  The configurable delay is 0.05-60 seconds, with a worker polling every 0.2 seconds.
+  A persisted due time plus the database lock prevents multiple API workers from
+  publishing the same tick. Playback resumes after server restart if still running.
+- `pause` waits for a complete in-flight transaction before acknowledging. Reaching
+  the selected end gives `completed`; reset begins another run. A publication failure
+  rolls back visibility and clock, records `error`, and requires a reset after repair.
+
+`replay_runs` and `active_run` hold operational state. Append-only `run_cultures` and
+`run_isolates` store exact visible source versions and the revision that published
+each one. Append-only `saved_analyses` stores report payloads. Every step commits bundle
+membership, demo date and revision together. Reset never deletes source history or
+old reports. The metadata catalogs describe the full source, while evidence reads
+only exact event IDs published in the active run.
+
+This is a synthetic simulation, not a live Tyks connection. Legacy `/events` writes
+retain their original history/statistics behavior but **do not publish into replay**,
+including corrections. An external complete-bundle publication adapter is still needed
+before using the versioned evidence API with a live feed. State explicitly labels
+this behavior as `legacy_event_ingestion: history_only`.
 
 ## Verify
 
@@ -266,9 +346,22 @@ Importer tests additionally cover ZIP/folder equivalence, short dates, validatio
 negative cultures, metadata revisions, concurrent imports and complete rollback.
 Evidence tests cover demographic selection, unknown metadata, combined ward counts,
 Wilson intervals, distinct suppression states, source coverage and concurrent snapshot reads.
+Publication tests cover complete/empty-day replay, rollback, stale run/revision tokens,
+concurrent steps/workers, pause acknowledgment, restart persistence, exports, HTTP/CLI
+agreement, structured errors and preventing staged future records from entering evidence.
 `python -m aei schema` prints the versioned input contract.
 
-Still pending: Flink processing, persisted result/alert history, alert definitions,
-live notifications and the dashboard. Statistics currently run on demand or during
-replay and load source history in memory; this is a correctness reference, not a
+The supplied-data check replayed all 28 days through 2026-09-27, ending with 46,792
+cultures and 24,571 isolates. An independent SQL query matched the ED / E. coli /
+urine / CIP / female / age 65+ cohort: 15 tested (15 S, 0 R) in 28 days and 210 tested
+(199 S, 11 R) in 12 months. Reset reproduced the seed evidence and retained old
+JSON/CSV exports; the source archive and main event history were unchanged. On this
+development machine, publication of the 28 steps took about 3.5 seconds excluding
+staging, an uncached evidence query 2.6 seconds, and a cached query 0.03 seconds.
+These are local smoke-check timings, not production throughput guarantees.
+
+Still pending: antibiotic A/B comparison, patient/specimen-history views, alert rules
+and investigation, external complete-bundle publication, Flink, live notifications
+and the dashboard. Saved evidence history is implemented. Calculations load published
+events in memory and serialize with replay publication; this is a correctness reference, not a
 production throughput claim. See [the Flink integration boundary](flink/README.md).

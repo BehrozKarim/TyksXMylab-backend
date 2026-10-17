@@ -12,8 +12,21 @@ Its `evidence-v1` method keeps the existing ward-policy default and date boundar
 it does not adopt the proposed calendar-year window or global-before-ward default.
 See [README](README.md) for the implemented contract and current limitations.
 The SQLite, missing-ZIP and `prototype-v1` references below describe the original
-planning baseline. Other `/api/v1` routes, stored analyses, replay controls, alerts
-and Flink remain proposals or later work.
+planning baseline.
+
+The existing-component API/replay upgrade now also implements `/api/v1/meta`, `/state`,
+published `/evidence`, saved analysis retrieval/JSON/CSV export and replay
+`start`/`pause`/`step`/`reset`, with uniform versioned errors and configurable CORS.
+PostgreSQL source staging is separate from exact run membership; publication, clock
+and revision commit atomically. Frozen reports retain run/revision and file hashes.
+The first use exposes imported complete bundles at their latest date; reset seeds an
+earlier paused run. CLI evidence and replay use this same service. Legacy event writes
+remain stored history and do not automatically enter published replay evidence.
+This adapts B3, the replay lifecycle and export work to the agreed two periods and
+Docker PostgreSQL. A/B comparison, patient/specimen history, alerts/investigation,
+external bundle publication, dashboard/live notifications and Flink remain later work.
+The original proposals below are retained for review; README and OpenAPI describe the
+implemented route names, response shapes and deliberate differences.
 
 Build a ward antibiotic evidence assistant that updates as synthetic laboratory records arrive. Its main outputs are susceptibility evidence across calendar annual, rolling 12-month and 28-day windows, an A/B laboratory comparison, specimen history, and automatically detected changes that a researcher can investigate.
 

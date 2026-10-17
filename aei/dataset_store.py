@@ -6,6 +6,7 @@ from psycopg import sql
 from psycopg.types.json import Jsonb
 
 from .dataset_models import DatasetBundle
+from .publication_store import publication_lock
 from .store import EventConflict
 
 
@@ -47,6 +48,7 @@ def initialize_dataset_tables(db):
         manifest_id TEXT NOT NULL REFERENCES dataset_manifests,
         payload JSONB NOT NULL
     )""")
+    db.execute("CREATE INDEX IF NOT EXISTS enrichment_culture_idx ON isolate_enrichments (culture_event_id)")
     for table in SOURCE_TABLES:
         db.execute(sql.SQL("""CREATE OR REPLACE TRIGGER forbid_source_mutation
             BEFORE UPDATE OR DELETE OR TRUNCATE ON {}
@@ -90,6 +92,7 @@ def import_bundle(store, bundle: DatasetBundle, through: date | None = None) -> 
     counts = {}
     with store.connection() as db:
         db.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"aei-import:{store.schema}",))
+        publication_lock(db, store.schema)
         inserted = db.execute("""INSERT INTO dataset_manifests (manifest_id, source_kind, payload)
             VALUES (%s, %s, %s) ON CONFLICT DO NOTHING""",
             (manifest_id, bundle.report.source_kind, Jsonb(payload))).rowcount

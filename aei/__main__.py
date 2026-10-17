@@ -3,18 +3,18 @@ import json
 import sys
 import time
 from datetime import date, timedelta
-from itertools import groupby
 from pathlib import Path
 
 from .config import database_url
-from .dataset import DatasetValidationError, default_dataset, load_bundle, load_dataset
-from .evidence import EvidenceQueryError, calculate_evidence
-from .evidence_models import EvidenceQuery
+from .dataset import DatasetValidationError, default_dataset, load_bundle
+from .evidence import EvidenceQueryError
 from .evidence_source import EvidenceUnavailable
 from .migration import read_sqlite_history
 from .models import AnalysisQuery, IsolateEvent
 from .postgres import PostgresEventStore
 from .processor import ReferenceProcessor, compare_periods
+from .publication import PublicationService
+from .publication_models import EvidenceRequest, ExpectedState, ReplayReset, ServiceError
 from .store import EventConflict
 
 
@@ -52,7 +52,7 @@ def main():
     add_filters(commands.add_parser("compare", help="Return the rolling 28-day and 12-month reports together"))
 
     evidence = commands.add_parser("evidence", help="Enriched evidence for one organism, specimen and antibiotic")
-    evidence.add_argument("--as-of", type=date.fromisoformat, required=True)
+    evidence.add_argument("--as-of", type=date.fromisoformat, help="Defaults to the published demo date")
     evidence.add_argument("--organism", required=True)
     evidence.add_argument("--specimen", choices=["urine", "blood", "wound"], required=True)
     evidence.add_argument("--antibiotic", dest="antibiotic_code", required=True)
@@ -64,10 +64,11 @@ def main():
     evidence.add_argument("--dedup-scope", choices=["selected_cohort", "all_wards"], default="selected_cohort")
 
     commands.add_parser("init-db", help="Initialize PostgreSQL event history")
+    commands.add_parser("state", help="Inspect the active publication run and demo clock")
     migration = commands.add_parser("migrate-sqlite", help="Copy legacy SQLite history into PostgreSQL")
     migration.add_argument("--sqlite", type=Path, required=True)
 
-    replay = commands.add_parser("replay", help="Replay daily batches and recalculate, including empty days")
+    replay = commands.add_parser("replay", help="Stage complete source bundles and publish daily, including empty days")
     add_source(replay)
     replay.add_argument("--from-date", type=date.fromisoformat, required=True)
     replay.add_argument("--through", type=date.fromisoformat, required=True)
@@ -116,12 +117,17 @@ def main():
     processor = ReferenceProcessor()
     if args.command == "evidence":
         try:
-            query = EvidenceQuery(**{key: value for key, value in vars(args).items()
-                                     if key in EvidenceQuery.model_fields and value is not None})
-            report = calculate_evidence(store.evidence_snapshot(), query)
-        except (EvidenceQueryError, EvidenceUnavailable, ValueError) as error:
+            query = EvidenceRequest(**{key: value for key, value in vars(args).items()
+                                       if key in EvidenceRequest.model_fields and value is not None})
+            report = PublicationService(store).evidence(query)
+        except (EvidenceQueryError, EvidenceUnavailable, ServiceError, ValueError) as error:
             parser.error(str(error))
         print(report.model_dump_json(indent=2))
+    elif args.command == "state":
+        try:
+            print(PublicationService(store).state().model_dump_json(indent=2))
+        except EvidenceUnavailable as error:
+            parser.error(str(error))
     elif args.command == "init-db":
         print(json.dumps({"storage": store.backend, "schema": store.schema, "total_events": store.count()}))
     elif args.command == "migrate-sqlite":
@@ -138,22 +144,26 @@ def main():
     elif args.command == "replay":
         if args.from_date > args.through or args.delay < 0:
             parser.error("Replay needs from-date <= through and a nonnegative delay")
-        if store.count():
-            parser.error("Replay requires an empty event table; use --schema with a new replay schema")
-        events = load_dataset(source)
-        store.append_many(event for event in events if event.sample_date < args.from_date)
-        by_day = {day: list(batch) for day, batch in groupby(events, key=lambda event: event.sample_date)}
-        day = args.from_date
-        while day <= args.through:
-            inserted, _ = store.append_many(by_day.get(day, []))
-            result = processor.calculate(store.events(), AnalysisQuery(as_of=day))
-            print(json.dumps({"as_of": day.isoformat(), "new_isolates": inserted,
-                              "history_events": store.count(), "groups": len(result.rows),
-                              "groups_with_percentages": sum(row.status == "available" for row in result.rows)}),
-                  flush=True)
-            if day < args.through and args.delay:
-                time.sleep(args.delay)
-            day += timedelta(days=1)
+        try:
+            bundle = load_bundle(source)
+            manifest = bundle.report.manifest
+            if (args.from_date < manifest.source_start or args.through > manifest.source_end):
+                parser.error("Replay dates must be within the source's observed range")
+            store.import_dataset(bundle)
+            publication = PublicationService(store)
+            state = publication.reset(ReplayReset(seed_through=args.from_date - timedelta(days=1),
+                                                   replay_through=args.through))
+            while state.status == "paused":
+                previous = state
+                state = publication.step(ExpectedState(expected_run_id=state.run_id,
+                                                        expected_revision=state.state_revision))
+                print(json.dumps({"state": state.model_dump(mode="json"),
+                    "new_cultures": state.published_cultures - previous.published_cultures,
+                    "new_isolates": state.published_isolates - previous.published_isolates}), flush=True)
+                if state.status != "completed" and args.delay:
+                    time.sleep(args.delay)
+        except (DatasetValidationError, EventConflict, EvidenceUnavailable, ServiceError, ValueError) as error:
+            parser.error(str(error))
 
 
 if __name__ == "__main__":
