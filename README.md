@@ -26,6 +26,13 @@ to deliver each batch; nothing is sent automatically. It resumes published progr
 a fresh demo run while preserving saved reports. Ctrl+C stops its servers and leaves
 PostgreSQL running. See [DEMO.md](DEMO.md) for setup, source paths, ports and verification.
 
+## Report summaries
+
+The ward overview offers an on-demand summary of its saved evidence report, with
+configurable OpenAI generation, validated sentence composition, persistent jobs and
+a labelled basic fallback. See [AI_SUMMARY.md](AI_SUMMARY.md) for configuration,
+the prompt, API contract and verification. Model calls run outside feed publication.
+
 ## Start the database and backend
 
 Run from this repository root using Python 3.11 and Docker Desktop (Linux containers):

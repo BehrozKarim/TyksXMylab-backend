@@ -16,6 +16,7 @@ from .evidence_source import read_evidence_snapshot
 from .models import IsolateEvent
 from .publication_store import initialize_publication_tables
 from .store import EventConflict
+from .summary_store import initialize_summary_tables
 
 
 class PostgresEventStore:
@@ -54,6 +55,7 @@ class PostgresEventStore:
             initialize_publication_tables(db)
             initialize_alert_tables(db)
             initialize_live_tables(db)
+            initialize_summary_tables(db)
 
     @contextmanager
     def connection(self):
