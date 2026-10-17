@@ -1,0 +1,39 @@
+# Backend repository Blueprint. Deploy the frontend's Blueprint separately.
+services:
+  - type: web
+    name: tyks-evidence-api
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m uvicorn aei.api:create_app --factory --host 0.0.0.0 --port $PORT --workers 1 --timeout-graceful-shutdown 60
+    healthCheckPath: /health
+    maxShutdownDelaySeconds: 90
+    envVars:
+      - key: AEI_DATABASE_URL
+        fromDatabase:
+          name: tyks-evidence-db
+          property: connectionString
+      - key: AEI_DATABASE_SCHEMA
+        value: aei_demo_hosted
+      - key: AEI_HOSTED_DEMO
+        value: "1"
+      - key: AEI_CORS_ORIGINS
+        sync: false
+      - key: AEI_FEED_TOKEN
+        generateValue: true
+      - key: AEI_SUMMARY_PROVIDER
+        value: openai
+      - key: AEI_SUMMARY_MODEL
+        value: gpt-4o-mini
+      - key: OPENAI_API_KEY
+        sync: false
+databases:
+  - name: tyks-evidence-db
+    plan: free
+    region: frankfurt
+    postgresMajorVersion: "17"
+    databaseName: aei
+    user: aei
+    # Temporarily allow only your own IP for the one-time local import.
+    ipAllowList: []
