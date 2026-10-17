@@ -77,7 +77,7 @@ The local launcher continues to use `/__demo` as before.
 
 1. Open the backend `/health` and wait for it to wake up.
 2. Open the dashboard and reload a deep link such as `/alerts`.
-3. Press **Send next lab batch** once. Processing should finish and the state revision
+3. Open **Demo feed** in the header and press **Send next lab batch** once. Processing should finish and the state revision
    should increase. The dashboard should refresh through its SSE connection.
 4. Repeat the previous delivery ID: it must not publish another batch. All visitors
    share the same run; the button shows the current next batch.
