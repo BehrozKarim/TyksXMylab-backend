@@ -15,6 +15,10 @@ Push the deployment changes first, then in Render select **New > Blueprint**, co
 `TyksXMylab-backend`, choose the branch containing these changes and use `render.yaml`.
 Review that both compute plans are **Free**. Leave the repository root directory empty.
 
+Free web services reject `maxShutdownDelaySeconds`; leave that field out of the
+Blueprint. Render uses its default 30-second shutdown limit. The Uvicorn command
+allows 20 seconds to drain requests, leaving time for application cleanup.
+
 Supply `OPENAI_API_KEY` as a backend environment secret. If AI is not wanted yet, set
 `AEI_SUMMARY_PROVIDER=none`; the existing report-based summary remains available.
 Supply `AEI_CORS_ORIGINS` with the eventual frontend HTTPS origin (no path or trailing
