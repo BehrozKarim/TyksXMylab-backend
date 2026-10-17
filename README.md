@@ -9,6 +9,7 @@ volume. Annual results now mean **rolling last 12 calendar months**, alongside t
 rolling last 28 days. The backend includes configurable resistance alerts and
 investigation APIs, complete-culture feed ingestion and reconnectable live updates.
 The separate `TyksXMylab-frontend` consumes these APIs; Flink remains deferred.
+For the public hosted demo, see [Render deployment](DEPLOYMENT.md).
 See [feed integration and the dashboard handoff](FEED_INTEGRATION.md) for the sender,
 API contract and EventSource example.
 

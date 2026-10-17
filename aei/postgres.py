@@ -17,6 +17,7 @@ from .models import IsolateEvent
 from .publication_store import initialize_publication_tables
 from .store import EventConflict
 from .summary_store import initialize_summary_tables
+from .hosted_demo import initialize_hosted_demo_tables
 
 
 class PostgresEventStore:
@@ -56,6 +57,7 @@ class PostgresEventStore:
             initialize_alert_tables(db)
             initialize_live_tables(db)
             initialize_summary_tables(db)
+            initialize_hosted_demo_tables(db)
 
     @contextmanager
     def connection(self):

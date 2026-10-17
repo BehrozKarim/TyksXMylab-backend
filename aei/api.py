@@ -3,6 +3,7 @@ from typing import Annotated
 from fastapi import Body, FastAPI, HTTPException, Query
 
 from .api_v1 import install_v1, replay_lifespan
+from .hosted_demo import install_hosted_demo
 from .config import database_schema, database_url as configured_database_url
 from .models import AnalysisQuery, AnalysisResult, ComparisonResult, IsolateEvent
 from .postgres import PostgresEventStore
@@ -66,4 +67,5 @@ def create_app(database_url: str | None = None, processor: Processor | None = No
             raise HTTPException(status_code=422, detail=str(error)) from error
 
     install_v1(app, publication, summaries)
+    install_hosted_demo(app, publication)
     return app
