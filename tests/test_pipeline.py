@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from aei.api import create_app
-from aei.dataset import load_dataset
+from aei.dataset import DEFAULT_DATASET, load_dataset
 from aei.models import AnalysisQuery, IsolateEvent, Susceptibility
 from aei.processor import ReferenceProcessor, compare_periods
 from aei.store import EventConflict, SQLiteEventStore
@@ -189,7 +189,7 @@ class StoreAndAPITests(unittest.TestCase):
         self.assertEqual(self.store.count(), 1)
 
     def test_api_ingestion_statistics_and_history(self):
-        with TestClient(create_app(self.path)) as client:
+        with TestClient(create_app(store=self.store)) as client:
             batch = [event(str(i), result="S" if i < 24 else "R").model_dump(mode="json") for i in range(30)]
             response = client.post("/events/batch", json=batch)
             self.assertEqual(response.status_code, 200, response.text)
@@ -210,12 +210,13 @@ class StoreAndAPITests(unittest.TestCase):
                 "as_of": "2026-09-27", "window_days": 365}).status_code, 422)
 
     def test_api_returns_conflict_for_a_changed_existing_event(self):
-        with TestClient(create_app(self.path)) as client:
+        with TestClient(create_app(store=self.store)) as client:
             client.post("/events", json=event().model_dump(mode="json"))
             self.assertEqual(client.post("/events", json=event(result="R").model_dump(mode="json")).status_code, 409)
 
 
 class SuppliedDatasetTests(unittest.TestCase):
+    @unittest.skipUnless(DEFAULT_DATASET.is_file(), "Set AEI_DATASET_PATH to the supplied synthetic ZIP")
     def test_supplied_archive_loads_into_complete_events(self):
         events = load_dataset()
         self.assertEqual(len(events), 24571)

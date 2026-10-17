@@ -1,30 +1,28 @@
-import os
-from pathlib import Path
 from typing import Annotated
 
 from fastapi import Body, FastAPI, HTTPException, Query
 
+from .config import database_url as configured_database_url
 from .models import AnalysisQuery, AnalysisResult, ComparisonResult, IsolateEvent
+from .postgres import PostgresEventStore
 from .processor import Processor, ReferenceProcessor, compare_periods
-from .store import EventConflict, SQLiteEventStore
+from .store import EventConflict, EventStore
 
 
-DEFAULT_DB = Path(__file__).resolve().parents[1] / ".data" / "aei.sqlite3"
-
-
-def create_app(db_path: str | Path | None = None, processor: Processor | None = None) -> FastAPI:
-    store = SQLiteEventStore(db_path or os.environ.get("AEI_DB_PATH", str(DEFAULT_DB)))
+def create_app(database_url: str | None = None, processor: Processor | None = None,
+               *, store: EventStore | None = None) -> FastAPI:
+    store = store if store is not None else PostgresEventStore(database_url or configured_database_url())
     calculation = processor or ReferenceProcessor()
     app = FastAPI(
         title="Tyks AEI reference pipeline",
         version="0.2.0",
-        description=("Local validation prototype. Explicit analysis dates, append-only isolate history, "
-                     "and reference calculations. Flink, alerts and a dashboard are not active yet."),
+        description=("PostgreSQL event history and reference calculations for rolling 28-day and "
+                     "12-month reports. Flink, alerts and a dashboard are not active yet."),
     )
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "storage": "sqlite", "processor": "reference",
+        return {"status": "ok", "storage": store.backend, "processor": type(calculation).__name__,
                 "events": store.count(), "rules_version": "prototype-v2"}
 
     def append(events):

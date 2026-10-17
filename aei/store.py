@@ -1,4 +1,4 @@
-"""SQLite is a local validation adapter, not the planned PostgreSQL CDC source."""
+"""Storage contract and legacy SQLite adapter for migration and isolated unit tests."""
 
 import sqlite3
 from contextlib import contextmanager
@@ -13,12 +13,14 @@ class EventConflict(ValueError):
 
 
 class EventStore(Protocol):
+    backend: str
     def append_many(self, events: Iterable[IsolateEvent]) -> tuple[int, int]: ...
     def events(self, isolate_id: str | None = None) -> list[IsolateEvent]: ...
     def count(self) -> int: ...
 
 
 class SQLiteEventStore:
+    backend = "sqlite"
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
