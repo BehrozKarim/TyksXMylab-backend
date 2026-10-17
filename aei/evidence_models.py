@@ -8,11 +8,10 @@ from pydantic import AwareDatetime, Field, model_validator
 from .models import AnalysisQuery, StrictModel
 
 
-class EvidenceQuery(StrictModel):
+class CohortQuery(StrictModel):
     as_of: date
     organism: str = Field(min_length=1)
     specimen: Literal["urine", "blood", "wound"]
-    antibiotic_code: str = Field(min_length=1)
     ward_code: str | None = Field(default=None, min_length=1)
     sex: Literal["F", "M"] | None = None
     age_min: int | None = Field(default=None, ge=0)
@@ -29,6 +28,10 @@ class EvidenceQuery(StrictModel):
             for period in ("rolling_28_days", "rolling_12_months"):
                 AnalysisQuery(as_of=self.as_of, period=period)
         return self
+
+
+class EvidenceQuery(CohortQuery):
+    antibiotic_code: str = Field(min_length=1)
 
 
 class ConfidenceInterval(StrictModel):

@@ -23,8 +23,14 @@ The first use exposes imported complete bundles at their latest date; reset seed
 earlier paused run. CLI evidence and replay use this same service. Legacy event writes
 remain stored history and do not automatically enter published replay evidence.
 This adapts B3, the replay lifecycle and export work to the agreed two periods and
-Docker PostgreSQL. A/B comparison, patient/specimen history, alerts/investigation,
-external bundle publication, dashboard/live notifications and Flink remain later work.
+Docker PostgreSQL. The next upgrade now implements `/api/v1/comparisons` (`comparison-v1`),
+bounded `/patients` ID search and `/patients/{id}/history` (`history-v1`). Paired
+comparisons use the existing cohort policy and require 30 common tested isolates;
+history retains every prior published specimen with revision-bound pagination.
+Both report types are frozen and exportable. The history range is the prior calendar
+anniversary inclusive through the selected cutoff exclusive, as specified below.
+Alerts/investigation, external bundle publication, dashboard/live notifications and
+Flink remain later work.
 The original proposals below are retained for review; README and OpenAPI describe the
 implemented route names, response shapes and deliberate differences.
 

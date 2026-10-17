@@ -11,8 +11,14 @@ from uuid import uuid4
 
 from psycopg.types.json import Jsonb
 
+from .analysis_models import (
+    ComparisonContext, ComparisonRequest, HistoryContext, HistoryRequest, PatientSearchRequest,
+    PatientSearchResult, SavedAnalysis, SavedComparison, SavedHistory, SourceContext,
+)
+from .comparisons import calculate_comparison
 from .evidence import calculate_evidence
 from .evidence_source import EvidenceUnavailable, snapshot_from_connection
+from .history import history_page, history_start, patient_visible, search_patients
 from .models import AnalysisQuery
 from .publication_models import (
     EvidenceRequest, ExpectedState, PublishedContext, ReplayReset, ReplayStart,
@@ -205,18 +211,10 @@ class PublicationService:
             state = self._active(db)
             self._check(state, request)
             query = request.resolved(state.demo_date)
-            if query.as_of > state.demo_date:
-                raise ServiceError(422, "future_as_of", "as_of cannot be later than the published demo date",
-                                   {"demo_date": state.demo_date.isoformat()})
-            values = query.model_dump(mode="json")
-            if query.known_at is not None:
-                values["known_at"] = query.known_at.astimezone(timezone.utc).isoformat()
-            key = hashlib.sha256(json.dumps(values, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-            cached = db.execute("""SELECT payload FROM saved_analyses WHERE run_id=%s AND state_revision=%s
-                AND method_version='evidence-v1' AND kind='evidence' AND query_key=%s""",
-                (state.run_id, state.state_revision, key)).fetchone()
+            self._as_of(state, query.as_of)
+            key, cached = self._cached(db, state, query, "evidence-v1", "evidence", SavedEvidence)
             if cached:
-                return SavedEvidence.model_validate(cached[0])
+                return cached
             snapshot = snapshot_from_connection(db, state.run_id)
             report = calculate_evidence(snapshot, query)
             context = PublishedContext(**report.context.model_dump(), run_id=state.run_id,
@@ -225,18 +223,108 @@ class PublicationService:
                 latest_visible_sample_date=state.latest_visible_sample_date, source_kind=state.source_kind,
                 source_files=snapshot.manifest.files, importer_version=snapshot.manifest.importer_version)
             saved = SavedEvidence(analysis_id=str(uuid4()), context=context, windows=report.windows)
-            db.execute("""INSERT INTO saved_analyses
-                (analysis_id, run_id, state_revision, method_version, kind, query_key, payload)
-                VALUES (%s, %s, %s, 'evidence-v1', 'evidence', %s, %s)""",
-                (saved.analysis_id, state.run_id, state.state_revision, key, Jsonb(saved.model_dump(mode="json"))))
-            return saved
+            return self._persist(db, saved, "evidence", key)
+
+    def _as_of(self, state, value):
+        as_of = value or state.demo_date
+        if as_of > state.demo_date:
+            raise ServiceError(422, "future_as_of", "as_of cannot be later than the published demo date",
+                               {"demo_date": state.demo_date.isoformat()})
+        return as_of
+
+    def _cached(self, db, state, query, method, kind, model):
+        values = query.model_dump(mode="json")
+        if getattr(query, "known_at", None) is not None:
+            values["known_at"] = query.known_at.astimezone(timezone.utc).isoformat()
+        key = hashlib.sha256(json.dumps(values, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        row = db.execute("""SELECT payload FROM saved_analyses WHERE run_id=%s AND state_revision=%s
+            AND method_version=%s AND kind=%s AND query_key=%s""",
+            (state.run_id, state.state_revision, method, kind, key)).fetchone()
+        return key, model.model_validate(row[0]) if row else None
+
+    def _persist(self, db, saved, kind, key):
+        db.execute("""INSERT INTO saved_analyses
+            (analysis_id, run_id, state_revision, method_version, kind, query_key, payload)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+            (saved.analysis_id, saved.context.run_id, saved.context.state_revision, saved.context.method_version,
+             kind, key, Jsonb(saved.model_dump(mode="json"))))
+        return saved
+
+    def _source_context(self, db, state):
+        manifest, _ = self._source(db)
+        return {**state.model_dump(include=set(SourceContext.model_fields)),
+                "source_files": manifest["files"], "importer_version": manifest["importer_version"],
+                "generated_at": datetime.now(timezone.utc)}
+
+    def comparison(self, request: ComparisonRequest):
+        with self.locked() as db:
+            state = self._active(db)
+            self._check(state, request)
+            query = request.resolved(state.demo_date)
+            self._as_of(state, query.as_of)
+            key, cached = self._cached(db, state, query, "comparison-v1", "comparison", SavedComparison)
+            if cached:
+                return cached
+            row, latest_received = calculate_comparison(snapshot_from_connection(db, state.run_id), query)
+            context = ComparisonContext(**self._source_context(db, state), filters=query,
+                ward_scope="selected_ward" if query.ward_code else "all_wards", latest_received_at=latest_received)
+            return self._persist(db, SavedComparison(analysis_id=str(uuid4()), context=context, comparison=row),
+                                 "comparison", key)
+
+    def patients(self, request: PatientSearchRequest):
+        with self.locked() as db:
+            state = self._active(db)
+            self._check(state, request)
+            as_of = self._as_of(state, request.as_of)
+            patients, more = search_patients(db, state.run_id, request.search, as_of, request.limit)
+            return PatientSearchResult(run_id=state.run_id, state_revision=state.state_revision, as_of=as_of,
+                search=request.search, limit=request.limit, has_more=more, patients=patients)
+
+    def patient_history(self, patient_id: str, request: HistoryRequest):
+        with self.locked() as db:
+            state = self._active(db)
+            self._check(state, request)
+            query = request.resolved(patient_id, state.demo_date)
+            before = None
+            if query.cursor:
+                try:
+                    previous = self._read_analysis(db, str(query.cursor))
+                except ServiceError as error:
+                    raise ServiceError(422, "invalid_cursor", "History cursor not found") from error
+                if not isinstance(previous, SavedHistory):
+                    raise ServiceError(422, "invalid_cursor", "Cursor must refer to a history page")
+                self._check(state, ExpectedState(expected_run_id=previous.context.run_id,
+                                                expected_revision=previous.context.state_revision))
+                old = previous.context.filters
+                if (old.patient_id, old.as_of, old.limit) != (query.patient_id, query.as_of, query.limit):
+                    raise ServiceError(422, "invalid_cursor", "Cursor belongs to different history filters")
+                if not previous.has_more or not previous.cultures:
+                    raise ServiceError(422, "invalid_cursor", "This history page has no next page")
+                last = previous.cultures[-1].record
+                before = last.sample_date, last.culture_id
+            self._as_of(state, query.as_of)
+            if not patient_visible(db, state.run_id, patient_id, query.as_of):
+                raise ServiceError(404, "patient_not_found", "Patient not found")
+            key, cached = self._cached(db, state, query, "history-v1", "history", SavedHistory)
+            if cached:
+                return cached
+            cultures, more = history_page(db, state.run_id, query, before)
+            context = HistoryContext(**self._source_context(db, state), filters=query,
+                start_date=history_start(query.as_of), end_date_exclusive=query.as_of)
+            analysis_id = str(uuid4())
+            return self._persist(db, SavedHistory(analysis_id=analysis_id, context=context, cultures=cultures,
+                has_more=more, next_cursor=analysis_id if more else None), "history", key)
 
     def analysis(self, analysis_id):
         with self.store.connection() as db:
-            row = db.execute("SELECT payload FROM saved_analyses WHERE analysis_id=%s", (analysis_id,)).fetchone()
+            return self._read_analysis(db, analysis_id)
+
+    def _read_analysis(self, db, analysis_id):
+        row = db.execute("SELECT kind, payload FROM saved_analyses WHERE analysis_id=%s", (analysis_id,)).fetchone()
         if row is None:
             raise ServiceError(404, "analysis_not_found", "Saved analysis not found")
-        return SavedEvidence.model_validate(row[0])
+        model = {"evidence": SavedEvidence, "comparison": SavedComparison, "history": SavedHistory}[row[0]]
+        return model.model_validate(row[1])
 
     def meta(self):
         with self.locked() as db:
@@ -254,15 +342,18 @@ class PublicationService:
                 "organisms": sorted({panel["organism"] for panel in manifest["observed_panels"]}),
                 "specimens": ["urine", "blood", "wound"], "sex": ["F", "M"],
                 "dedup_scopes": ["selected_cohort", "all_wards"],
+                "comparison_antibiotics": [drug["antibiotic_code"] for drug in drugs if not drug["is_screening"]],
+                "analysis_methods": {"evidence": "evidence-v1", "comparison": "comparison-v1", "history": "history-v1"},
                 "observed_panels": manifest["observed_panels"], "warnings": manifest.get("warnings", []),
                 "limitations": ["Synthetic laboratory susceptibility; not treatment efficacy",
                     "Metadata and panel availability describe the full source, not future patient results",
                     "Only published complete source bundles enter evidence; legacy event writes remain outside replay",
                     "Same-day ordering, ward-transfer policy and untested-first-isolate policy await partner confirmation",
-                    "Alerts, patient-history views, antibiotic A/B comparison and Flink are not implemented"]}
+                    "Patient history shows collection dates and raw recorded AST, not treatment outcomes",
+                    "Alerts, dashboard, external bundle publication and Flink are not implemented"]}
 
 
-def export_csv(report: SavedEvidence) -> str:
+def export_csv(report: SavedAnalysis) -> str:
     """Flatten the frozen document, including provenance and suppression nulls."""
     def flatten(value, prefix=""):
         result = {}
@@ -277,9 +368,26 @@ def export_csv(report: SavedEvidence) -> str:
 
     document = report.model_dump(mode="json")
     common = flatten({"analysis_id": document["analysis_id"], "context": document["context"]})
-    rows = [{**common, **flatten(window)} for window in document["windows"].values()]
+    if isinstance(report, SavedEvidence):
+        rows = [{**common, **flatten(window)} for window in document["windows"].values()]
+    elif isinstance(report, SavedComparison):
+        rows = [{**common, "record_type": "paired_comparison", **flatten(document["comparison"])}]
+    else:
+        rows = []
+        page = {"has_more": report.has_more, "next_cursor": report.next_cursor}
+        for culture in document["cultures"]:
+            base = {**common, **page, **flatten({"culture": {key: item for key, item in culture.items() if key != "isolates"}})}
+            rows.append({**base, "record_type": "culture"})
+            for isolate in culture["isolates"]:
+                event = {key: item for key, item in isolate["event"].items() if key != "tests"}
+                details = {**base, **flatten({"isolate": {"event": event, "enrichment": isolate["enrichment"]}})}
+                rows.append({**details, "record_type": "isolate"})
+                for test in isolate["event"]["tests"]:
+                    rows.append({**details, "record_type": "ast", **flatten({"test": test})})
+        if not rows:
+            rows = [{**common, **page, "record_type": "history_summary", "culture_count": 0}]
     output = io.StringIO(newline="")
-    writer = csv.DictWriter(output, fieldnames=list(rows[0]))
+    writer = csv.DictWriter(output, fieldnames=list(dict.fromkeys(key for row in rows for key in row)))
     writer.writeheader()
     writer.writerows(rows)
     return output.getvalue()

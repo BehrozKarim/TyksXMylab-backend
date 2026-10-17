@@ -17,6 +17,8 @@ from pydantic import ValidationError
 from starlette.exceptions import HTTPException
 
 from .evidence import EvidenceQueryError
+from .analysis_models import (ComparisonRequest, HistoryRequest, PatientSearchRequest,
+                              PatientSearchResult, SavedAnalysis, SavedComparison, SavedHistory)
 from .evidence_source import EvidenceUnavailable
 from .publication import export_csv
 from .publication_models import (
@@ -130,7 +132,19 @@ def install_v1(app, service):
     def evidence(query: Annotated[EvidenceRequest, Query()]):
         return backend().evidence(query)
 
-    @router.get("/analyses/{analysis_id}", response_model=SavedEvidence)
+    @router.get("/comparisons", response_model=SavedComparison)
+    def comparisons(query: Annotated[ComparisonRequest, Query()]):
+        return backend().comparison(query)
+
+    @router.get("/patients", response_model=PatientSearchResult)
+    def patients(query: Annotated[PatientSearchRequest, Query()]):
+        return backend().patients(query)
+
+    @router.get("/patients/{patient_id}/history", response_model=SavedHistory)
+    def history(patient_id: str, query: Annotated[HistoryRequest, Query()]):
+        return backend().patient_history(patient_id, query)
+
+    @router.get("/analyses/{analysis_id}", response_model=SavedAnalysis)
     def analysis(analysis_id: str):
         return backend().analysis(analysis_id)
 

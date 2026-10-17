@@ -59,9 +59,7 @@ def coverage_for(snapshot: EvidenceSnapshot, start, end) -> SourceCoverage:
         source_isolates_expected=expected_isolates, source_isolates_enriched=imported_enrichments)
 
 
-def calculate_evidence(snapshot: EvidenceSnapshot, query: EvidenceQuery) -> EvidenceReport:
-    if query.antibiotic_code not in snapshot.antibiotics:
-        raise EvidenceQueryError("antibiotic_code", "Unknown antibiotic code")
+def validate_cohort(snapshot, query):
     wards = snapshot.ward_codes | {event.ward_code for event in snapshot.events}
     if query.ward_code is not None and query.ward_code not in wards:
         raise EvidenceQueryError("ward_code", "Unknown ward code")
@@ -69,32 +67,46 @@ def calculate_evidence(snapshot: EvidenceSnapshot, query: EvidenceQuery) -> Evid
     organisms.update(event.organism for event in snapshot.events)
     if query.organism not in organisms:
         raise EvidenceQueryError("organism", "Unknown organism")
+
+
+def eligible_for_period(snapshot, latest, query, period):
+    """Choose first isolates before demographic filters or antibiotic availability."""
+    selection = AnalysisQuery(as_of=query.as_of, period=period, ward_code=query.ward_code,
+        organism=query.organism, specimen=query.specimen, dedup_scope=query.dedup_scope)
+    first = select_first_isolates(latest, selection)
+    eligible = []
+    unknown_sex = unknown_age = excluded_unknown = excluded_nonmatching = 0
+    for event in first:
+        metadata = snapshot.enrichments.get(event.event_id)
+        sex = metadata.sex if metadata else None
+        age = metadata.age_years if metadata else None
+        unknown_sex += sex is None
+        unknown_age += age is None
+        if ((query.sex is not None and sex is None)
+                or ((query.age_min is not None or query.age_max is not None) and age is None)):
+            excluded_unknown += 1
+            continue
+        if ((query.sex is not None and sex != query.sex)
+                or (query.age_min is not None and age < query.age_min)
+                or (query.age_max is not None and age > query.age_max)):
+            excluded_nonmatching += 1
+            continue
+        eligible.append(event)
+    completeness = MetadataCompleteness(retained_before_demographic_filters=len(first),
+        unknown_sex=unknown_sex, unknown_age=unknown_age, excluded_unknown=excluded_unknown,
+        excluded_nonmatching=excluded_nonmatching)
+    return selection, tuple(eligible), completeness
+
+
+def calculate_evidence(snapshot: EvidenceSnapshot, query: EvidenceQuery) -> EvidenceReport:
+    if query.antibiotic_code not in snapshot.antibiotics:
+        raise EvidenceQueryError("antibiotic_code", "Unknown antibiotic code")
+    validate_cohort(snapshot, query)
     drug = snapshot.antibiotics[query.antibiotic_code]
     latest, latest_received = resolve_latest(snapshot.events, query.known_at)
     windows = {}
     for period in ("rolling_28_days", "rolling_12_months"):
-        selection = AnalysisQuery(as_of=query.as_of, period=period, ward_code=query.ward_code,
-            organism=query.organism, specimen=query.specimen, dedup_scope=query.dedup_scope)
-        first = select_first_isolates(latest, selection)
-        eligible = []
-        unknown_sex = unknown_age = excluded_unknown = excluded_nonmatching = 0
-        for event in first:
-            # Metadata belongs to an event ID, never just a patient or an isolate ID.
-            metadata = snapshot.enrichments.get(event.event_id)
-            sex = metadata.sex if metadata else None
-            age = metadata.age_years if metadata else None
-            unknown_sex += sex is None
-            unknown_age += age is None
-            if ((query.sex is not None and sex is None)
-                    or ((query.age_min is not None or query.age_max is not None) and age is None)):
-                excluded_unknown += 1
-                continue
-            if ((query.sex is not None and sex != query.sex)
-                    or (query.age_min is not None and age < query.age_min)
-                    or (query.age_max is not None and age > query.age_max)):
-                excluded_nonmatching += 1
-                continue
-            eligible.append(event)
+        selection, eligible, metadata = eligible_for_period(snapshot, latest, query, period)
         results = [test.result for event in eligible for test in event.tests
                    if test.antibiotic_code == query.antibiotic_code]
         tested, susceptible = len(results), results.count("S")
@@ -119,9 +131,7 @@ def calculate_evidence(snapshot: EvidenceSnapshot, query: EvidenceQuery) -> Evid
             ci95=ConfidenceIntervals(
                 susceptibility=wilson_interval(susceptible, tested) if available else ConfidenceInterval(),
                 resistance=wilson_interval(resistant, tested) if available else ConfidenceInterval()),
-            metadata=MetadataCompleteness(retained_before_demographic_filters=len(first),
-                unknown_sex=unknown_sex, unknown_age=unknown_age, excluded_unknown=excluded_unknown,
-                excluded_nonmatching=excluded_nonmatching),
+            metadata=metadata,
             coverage=coverage_for(snapshot, selection.period_start, query.as_of))
     return EvidenceReport(context=EvidenceContext(
         ward_scope="selected_ward" if query.ward_code else "all_wards", filters=query,

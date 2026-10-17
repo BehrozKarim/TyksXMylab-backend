@@ -101,8 +101,8 @@ through that inclusive date. Repeating the same source with a later cutoff exten
 the import. Dictionaries/patients and the manifest describe the whole source, while
 the returned per-table counts describe the selected import. Source staging and replay
 visibility are separate: a later import does not silently change an existing run.
-Complete the import, then reset replay to publish a new view. A patient-history API
-remains later work.
+Complete the import, then reset replay to publish a new view. Patient-history and
+comparison APIs read only the records published in that view.
 
 ## Reports and API
 
@@ -124,6 +124,9 @@ remains later work.
 - `GET /api/v1/meta`: filter dictionaries, observed panels, screening labels, supported
   periods, source bounds, defaults and limitations.
 - `GET /api/v1/state`: active run, revision, demo date and published culture/isolate counts.
+- `GET /api/v1/comparisons`: paired susceptibility of two antibiotics in one selected period.
+- `GET /api/v1/patients?search=`: bounded ID search over patients with visible specimens.
+- `GET /api/v1/patients/{patient_id}/history`: paginated prior specimen/AST history.
 - `GET /api/v1/analyses/{analysis_id}`: retrieve the original saved response.
 - `GET /api/v1/analyses/{analysis_id}/export?format=json|csv`: download that response.
 - `POST /api/v1/replay/reset|start|pause|step`: control the synthetic replay.
@@ -215,13 +218,13 @@ knowledge-time offsets normalize identically. Steps (including empty days), star
 pause change the revision; reset creates a new run. Old reports and exports never change.
 No source patient identifiers appear in aggregate exports.
 
-JSON exports contain the saved document. CSV exports contain two rows, one per period,
+JSON exports contain the saved document. Evidence CSV exports contain two rows, one per period,
 with flattened dotted field names for context, filters, provenance, coverage and interval
 bounds. Suppressed percentages/intervals are empty; counts and status are retained.
 Spreadsheet formula prefixes in source labels are escaped with a leading apostrophe.
 
 For coordinated reads, send `expected_run_id` and `expected_revision` together, using
-`/api/v1/state`. Evidence accepts them as query parameters; replay controls accept them
+`/api/v1/state`. Evidence, comparison, patient search and history accept them as query parameters; replay controls accept them
 in the JSON body. A mismatch returns HTTP 409 with `error.details.state` and creates
 no analysis. Omitting both uses whichever state is current when the request acquires
 the lock. Clients may poll state every two seconds; push notifications are not implemented.
@@ -231,6 +234,97 @@ Versioned errors consistently use
 with the same ID in `X-Request-ID`. Legacy routes retain their original error shapes.
 Set `AEI_CORS_ORIGINS` to a comma-separated list of allowed frontend origins; defaults
 are `http://localhost:3000` and `http://127.0.0.1:3000`.
+
+### Antibiotic comparison
+
+```text
+GET /api/v1/comparisons?organism=Escherichia%20coli&specimen=urine&antibiotic_a=CIP&antibiotic_b=TMP&ward_code=ED&window=rolling_12_months&as_of=2026-09-27
+```
+
+Require one organism/specimen and two different antibiotic codes. `window` accepts
+`rolling_28_days` (default) or `rolling_12_months`. Other cohort filters match evidence:
+ward, sex, inclusive age bounds, `known_at` and the existing `selected_cohort` default
+deduplication scope. The CLI `compare` and `/statistics/comparison` still compare
+reporting periods; `/api/v1/comparisons` compares antibiotics.
+
+The `comparison-v1` method shares evidence's revision resolution, first-isolate and
+demographic selection. It then keeps only retained isolates tested for **both** drugs.
+A later tested isolate never replaces an untested first isolate. Results include:
+
+- `n_eligible`, each drug's marginal `n_tested_a`/`n_tested_b`, and common `n_paired`.
+- `n_missing_a`, `n_missing_b` and `n_missing_either`. Isolates missing both appear in
+  each individual missing count, but only once in `n_missing_either`.
+- Four cells: `both_s`, `a_only_s` (A=S/B=R), `b_only_s` (A=R/B=S), and `both_r`.
+  Their sum is `n_paired`; `n_paired + n_missing_either = n_eligible`.
+
+On the common denominator N, the five measures are:
+
+| Field | Calculation |
+| --- | --- |
+| `a_susceptibility_pct` | `100 * (both_s + a_only_s) / N` |
+| `b_susceptibility_pct` | `100 * (both_s + b_only_s) / N` |
+| `net_difference_pp` | `100 * (b_only_s - a_only_s) / N` (B minus A, percentage points) |
+| `b_only_added_pct` | `100 * b_only_s / N` |
+| `at_least_one_s_pct` | `100 * (N - both_r) / N` |
+
+Status precedence is `not_applicable` for a dictionary specimen conflict,
+`empty_cohort`, `no_paired_tests`, `insufficient_data` for 1-29 pairs, then `available`.
+All five measures are null unless status is `available`, even if both marginal drug
+counts reach 30. Counts, demographic completeness and source coverage stay visible.
+Same-drug, unknown-drug and screening-drug comparisons return 422. FOX remains
+available as labeled single-drug evidence; `/meta.comparison_antibiotics` excludes screens.
+These are laboratory observations, with no drug ranking, synergy or treatment-efficacy claim.
+
+Comparison responses carry a saved `analysis_id` and full source/run/filter context.
+JSON export preserves the response; CSV has one `paired_comparison` row, including
+all cells, denominators, missing counts, suppressed values and provenance.
+
+### Patient specimen history
+
+```text
+GET /api/v1/patients?search=000&as_of=2026-09-27&limit=20
+GET /api/v1/patients/{patient_id}/history?as_of=2026-09-27&limit=25
+```
+
+Replace `{patient_id}` with an ID returned by search. Search uses a literal,
+case-sensitive substring (1-100 characters); `%` and `_` are not wildcards. It returns
+at most `limit` IDs (default 20, maximum 100), ordered by ID, with visible culture
+counts, latest collected dates, `has_more`, and the run/revision. Narrow the search
+when `has_more` is true. Eligibility requires any published specimen collected on or
+before `as_of`; it is independent of the history lookback and includes negative specimens.
+Search is a lookup response, not a saved analysis.
+
+The `history-v1` view returns **specimens collected before the selected date**, in
+`[prior calendar-year anniversary, as_of)`. For cutoff 2026-09-27, it includes
+2025-09-27 through 2026-09-26. February 29 clamps to February 28 in the previous year.
+Unlike the inclusive surveillance periods, the cutoff date itself is excluded.
+Both search/history default to the demo date and reject future `as_of` values.
+
+History includes every earlier published culture, negative/mixed cultures, repeated
+isolates, all species/wards and each isolate's complete recorded AST panel. It applies
+no surveillance first-isolate, drug, ward, species, sex or age filter. Unsupported
+cohort filters are rejected. Latest visible culture/isolate revisions are resolved
+before patient/date filtering; matching enrichment is attached only by exact event ID.
+Collection dates do not establish when clinicians received results. This view shows
+individual S/R test results without calculating a patient-level susceptibility percentage.
+
+A current-date-only patient, or one whose specimens are all older than the lookback,
+returns 200 with an empty prior-history list. Unknown and future-only patients receive
+the same 404 error. IDs from staged future data do not appear in search.
+
+History pages use `limit` (default 25, maximum 100) and sort by collection date, then
+culture ID, both descending. Each page is a saved analysis with source/run context.
+When `has_more` is true, pass `next_cursor` as the next request's `cursor`, retaining
+the patient, cutoff and limit. The opaque cursor references a saved page and is bound
+to its run, revision and filters. A replay step/reset/control change returns 409 for
+an old cursor; restart pagination from the first page. Malformed or mismatched cursors
+return 422. Existing saved pages remain downloadable across replay changes.
+
+History JSON exports preserve the page exactly. CSV repeats context and page metadata
+on `culture`, `isolate` and `ast` rows, retaining zero-isolate cultures and isolates
+without AST. An empty page produces a `history_summary` row. A history export contains
+the selected patient's identifiers and recorded laboratory data, unlike aggregate
+evidence/comparison exports. Export additional pages separately when history spans pages.
 
 ### Rolling-year definition
 
@@ -349,6 +443,10 @@ Wilson intervals, distinct suppression states, source coverage and concurrent sn
 Publication tests cover complete/empty-day replay, rollback, stale run/revision tokens,
 concurrent steps/workers, pause acknowledgment, restart persistence, exports, HTTP/CLI
 agreement, structured errors and preventing staged future records from entering evidence.
+Comparison/history tests cover common-denominator suppression, all four S/R cells,
+drug-order reversal, missing tests, screening exclusions, independent windows,
+strict history boundaries, negative specimens, repeated isolates, revision corrections,
+hidden future IDs, cursor isolation, concurrent reset and preserved exports.
 `python -m aei schema` prints the versioned input contract.
 
 The supplied-data check replayed all 28 days through 2026-09-27, ending with 46,792
@@ -360,8 +458,16 @@ development machine, publication of the 28 steps took about 3.5 seconds excludin
 staging, an uncached evidence query 2.6 seconds, and a cached query 0.03 seconds.
 These are local smoke-check timings, not production throughput guarantees.
 
-Still pending: antibiotic A/B comparison, patient/specimen-history views, alert rules
-and investigation, external complete-bundle publication, Flink, live notifications
-and the dashboard. Saved evidence history is implemented. Calculations load published
+The comparison/history supplied-data check also passed: for the same ED / E. coli /
+urine / female / age 65+ cohort, CIP versus TMP had 15 paired tests in 28 days
+(percentages suppressed) and 210 in 12 months. The annual four-cell counts were
+166 both-S, 33 A-only-S, 9 B-only-S and 2 both-R, matching an independent SQL query.
+A selected patient's 18 prior cultures (9 negative/mixed) across nine pages matched
+the source specimens and every recorded AST result. Reset kept old history exports
+unchanged and hid future-only patient IDs. No source files or main event history changed.
+
+Still pending: alert rules and investigation, external complete-bundle publication,
+Flink, live notifications and the dashboard. Evidence, antibiotic comparison and patient
+history API views with saved exports are implemented. Calculations load published
 events in memory and serialize with replay publication; this is a correctness reference, not a
 production throughput claim. See [the Flink integration boundary](flink/README.md).

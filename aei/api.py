@@ -18,7 +18,7 @@ def create_app(database_url: str | None = None, processor: Processor | None = No
     publication = PublicationService(store) if isinstance(store, PostgresEventStore) else None
     app = FastAPI(
         title="Tyks AEI reference pipeline",
-        version="0.4.0",
+        version="0.5.0",
         lifespan=replay_lifespan(publication),
         description=("PostgreSQL event history and reference calculations for rolling 28-day and "
                      "12-month reports. Flink, alerts and a dashboard are not active yet."),
