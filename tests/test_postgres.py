@@ -4,7 +4,10 @@ import os
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 from uuid import uuid4
 
 import psycopg
@@ -14,6 +17,8 @@ from psycopg import sql
 from aei.api import create_app
 from aei.dataset import load_bundle
 from aei.dataset_store import SOURCE_TABLES
+from aei.evidence import calculate_evidence
+from aei.evidence_models import EvidenceQuery
 from aei.migration import read_sqlite_history
 from aei.postgres import PostgresEventStore
 from aei.store import EventConflict, SQLiteEventStore
@@ -201,3 +206,86 @@ class PostgresTests(unittest.TestCase):
                         statement = (sql.SQL("UPDATE {} SET payload=%s").format(sql.Identifier(table))
                                      if template.startswith("UPDATE") else sql.SQL(template).format(sql.Identifier(table)))
                         db.execute(statement, (psycopg.types.json.Jsonb({}),) if template.startswith("UPDATE") else None)
+
+    def test_evidence_api_requires_import_and_validates_demographic_filters(self):
+        params = dict(as_of="2026-09-27", organism="Escherichia coli", specimen="urine", antibiotic_code="CIP")
+        with TestClient(create_app(store=self.store)) as client:
+            self.assertEqual(client.get("/api/v1/evidence", params=params).status_code, 503)
+            self.store.import_dataset(self.fixture_bundle())
+            response = client.get("/api/v1/evidence", params={**params, "sex": "F", "age_min": 26, "age_max": 26})
+            self.assertEqual(response.status_code, 200, response.text)
+            report = response.json()
+            self.assertEqual(report["context"]["method_version"], "evidence-v1")
+            self.assertEqual(report["context"]["ward_scope"], "all_wards")
+            self.assertEqual(report["context"]["filters"]["dedup_scope"], "selected_cohort")
+            for period in ("rolling_28_days", "rolling_12_months"):
+                row = report["windows"][period]
+                self.assertEqual(row["n_eligible"], 1)
+                self.assertEqual(row["n_s"], 1)
+                self.assertEqual(row["status"], "insufficient_data")
+                self.assertIsNone(row["ci95"]["susceptibility"]["lower"])
+                self.assertTrue(row["coverage"]["source_fully_imported"])
+            for changes in ({"sex": "X"}, {"age_min": -1}, {"age_min": 80, "age_max": 30},
+                            {"antibiotic_code": "UNKNOWN"}, {"organism": "UNKNOWN"}, {"ward_code": "UNKNOWN"}):
+                with self.subTest(changes=changes):
+                    self.assertEqual(client.get("/api/v1/evidence", params={**params, **changes}).status_code, 422)
+            self.assertEqual(client.get("/api/v1/evidence", params={"as_of": "2026-09-27"}).status_code, 422)
+            legacy = client.get("/statistics", params={"as_of": "2026-09-27"}).json()
+            self.assertEqual(legacy["rules_version"], "prototype-v2")
+            self.assertNotIn("ci95", legacy["rows"][0])
+            self.assertIn("/api/v1/evidence", client.get("/openapi.json").json()["paths"])
+
+    def test_evidence_snapshot_excludes_a_concurrent_committed_event(self):
+        self.store.import_dataset(self.fixture_bundle())
+        original_connection = self.store.connection
+        added = False
+
+        class InterleavingReader:
+            def __init__(self, db):
+                self.db = db
+
+            def execute(inner, statement, *args, **kwargs):
+                nonlocal added
+                result = inner.db.execute(statement, *args, **kwargs)
+                if statement == "SELECT payload FROM dataset_manifests" and not added:
+                    added = True
+                    # Commit a new event after the reader has acquired its snapshot.
+                    with original_connection() as writer:
+                        self.store.append_many_in_transaction(writer, [event("concurrent")])
+                return result
+
+        @contextmanager
+        def connection():
+            with original_connection() as db:
+                yield InterleavingReader(db)
+
+        with patch.object(self.store, "connection", connection):
+            data = self.store.evidence_snapshot()
+        self.assertTrue(added)
+        self.assertEqual(len(data.events), 2)
+        self.assertEqual(self.store.count(), 3)
+        self.assertEqual(len(self.store.evidence_snapshot().events), 3)
+
+    def test_partial_import_is_not_reported_as_complete_source_coverage(self):
+        self.store.import_dataset(self.fixture_bundle(), through=date(2026, 9, 26))
+        data = self.store.evidence_snapshot()
+        report = calculate_evidence(data, EvidenceQuery(as_of=date(2026, 9, 27),
+            organism="Escherichia coli", specimen="urine", antibiotic_code="CIP"))
+        coverage = report.windows.rolling_28_days.coverage
+        self.assertFalse(coverage.source_fully_imported)
+        self.assertEqual((coverage.source_cultures_expected, coverage.source_cultures_imported), (4, 3))
+        self.assertEqual((coverage.source_isolates_expected, coverage.source_isolates_enriched), (2, 1))
+        self.assertEqual(coverage.imported_culture_end, date(2026, 9, 26))
+        self.assertEqual(coverage.source_end, date(2026, 9, 27))
+
+    def test_evidence_reader_does_not_attach_metadata_from_previous_revision(self):
+        bundle = self.fixture_bundle()
+        self.store.import_dataset(bundle)
+        correction = bundle.events[0].model_copy(update={"event_id": "corrected:i1:2", "revision": 2})
+        self.store.append_many([correction])
+        data = self.store.evidence_snapshot()
+        self.assertNotIn(correction.event_id, data.enrichments)
+        report = calculate_evidence(data, EvidenceQuery(as_of=date(2026, 9, 27), sex="F",
+            organism="Escherichia coli", specimen="urine", antibiotic_code="CIP"))
+        self.assertEqual(report.windows.rolling_28_days.n_eligible, 0)
+        self.assertEqual(report.windows.rolling_28_days.metadata.excluded_unknown, 1)

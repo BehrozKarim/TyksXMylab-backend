@@ -8,6 +8,9 @@ from pathlib import Path
 
 from .config import database_url
 from .dataset import DatasetValidationError, default_dataset, load_bundle, load_dataset
+from .evidence import EvidenceQueryError, calculate_evidence
+from .evidence_models import EvidenceQuery
+from .evidence_source import EvidenceUnavailable
 from .migration import read_sqlite_history
 from .models import AnalysisQuery, IsolateEvent
 from .postgres import PostgresEventStore
@@ -47,6 +50,18 @@ def main():
     stats.add_argument("--period", choices=["rolling_28_days", "rolling_12_months"])
     stats.add_argument("--start-date", type=date.fromisoformat)
     add_filters(commands.add_parser("compare", help="Return the rolling 28-day and 12-month reports together"))
+
+    evidence = commands.add_parser("evidence", help="Enriched evidence for one organism, specimen and antibiotic")
+    evidence.add_argument("--as-of", type=date.fromisoformat, required=True)
+    evidence.add_argument("--organism", required=True)
+    evidence.add_argument("--specimen", choices=["urine", "blood", "wound"], required=True)
+    evidence.add_argument("--antibiotic", dest="antibiotic_code", required=True)
+    evidence.add_argument("--ward", dest="ward_code")
+    evidence.add_argument("--sex", choices=["F", "M"])
+    evidence.add_argument("--age-min", type=int)
+    evidence.add_argument("--age-max", type=int)
+    evidence.add_argument("--known-at", help="ISO timestamp limiting which event revisions are known")
+    evidence.add_argument("--dedup-scope", choices=["selected_cohort", "all_wards"], default="selected_cohort")
 
     commands.add_parser("init-db", help="Initialize PostgreSQL event history")
     migration = commands.add_parser("migrate-sqlite", help="Copy legacy SQLite history into PostgreSQL")
@@ -99,7 +114,15 @@ def main():
 
     store = PostgresEventStore(args.database_url, schema=args.schema)
     processor = ReferenceProcessor()
-    if args.command == "init-db":
+    if args.command == "evidence":
+        try:
+            query = EvidenceQuery(**{key: value for key, value in vars(args).items()
+                                     if key in EvidenceQuery.model_fields and value is not None})
+            report = calculate_evidence(store.evidence_snapshot(), query)
+        except (EvidenceQueryError, EvidenceUnavailable, ValueError) as error:
+            parser.error(str(error))
+        print(report.model_dump_json(indent=2))
+    elif args.command == "init-db":
         print(json.dumps({"storage": store.backend, "schema": store.schema, "total_events": store.count()}))
     elif args.command == "migrate-sqlite":
         events = read_sqlite_history(args.sqlite)

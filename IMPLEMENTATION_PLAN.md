@@ -5,11 +5,15 @@ Status: implementation plan for extending the runnable reference prototype at co
 Development update: the current backend uses Docker PostgreSQL and `prototype-v2`
 with rolling 28-day and rolling 12-month reports. The first importer/storage upgrade
 now supports validated ZIP/CSV-folder imports, source manifests, complete cultures
-and revision-bound enrichment in one PostgreSQL transaction. See [README](README.md)
-for current commands and limitations. The SQLite, missing-ZIP and `prototype-v1`
-references below describe the original planning baseline. Additional report windows,
-changed counting policies, `/api/v1`, replay controls, alerts and Flink remain proposals
-or later work; they are not implemented by this importer/storage milestone.
+and revision-bound enrichment in one PostgreSQL transaction. The next calculation
+upgrade adds `/api/v1/evidence` and CLI `evidence`: both agreed windows, age/sex filters,
+combined all-wards evidence, richer statuses, Wilson intervals and source coverage.
+Its `evidence-v1` method keeps the existing ward-policy default and date boundaries;
+it does not adopt the proposed calendar-year window or global-before-ward default.
+See [README](README.md) for the implemented contract and current limitations.
+The SQLite, missing-ZIP and `prototype-v1` references below describe the original
+planning baseline. Other `/api/v1` routes, stored analyses, replay controls, alerts
+and Flink remain proposals or later work.
 
 Build a ward antibiotic evidence assistant that updates as synthetic laboratory records arrive. Its main outputs are susceptibility evidence across calendar annual, rolling 12-month and 28-day windows, an A/B laboratory comparison, specimen history, and automatically detected changes that a researcher can investigate.
 

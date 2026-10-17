@@ -114,11 +114,83 @@ replay visibility or a patient-history API; those remain later development steps
 - `GET /statistics?as_of=2026-09-27`: latest 28 days by default.
 - `GET /statistics?as_of=2026-09-27&period=rolling_12_months`: latest 12 months.
 - `GET /statistics/comparison?as_of=2026-09-27`: both periods from one source snapshot.
+- `GET /api/v1/evidence`: enriched evidence for one organism, specimen and antibiotic,
+  with both periods, demographic filters, confidence intervals and source coverage.
 
 Filters: `ward_code`, `organism`, `specimen`, `antibiotic_code`, `dedup_scope`.
 `known_at` optionally restricts results to revisions received by that timestamp.
 `as_of` controls sample dates, not knowledge time. Without `known_at`, the latest
 known revisions are used. No system date is selected implicitly.
+
+### Enriched evidence
+
+Run `import-dataset` first to populate the dictionaries, manifest and revision-bound
+metadata. Existing `/statistics` responses and `prototype-v2` rounding/status rules
+remain unchanged. The additive evidence contract identifies itself as `evidence-v1`.
+
+```powershell
+.\.venv\Scripts\python.exe -m aei evidence --as-of 2026-09-27 --ward ED --organism "Escherichia coli" --specimen urine --antibiotic CIP --sex F --age-min 65
+```
+
+Equivalent HTTP request:
+
+```text
+GET /api/v1/evidence?as_of=2026-09-27&ward_code=ED&organism=Escherichia%20coli&specimen=urine&antibiotic_code=CIP&sex=F&age_min=65
+```
+
+Required inputs are `as_of`, `organism`, `specimen` and `antibiotic_code`. Optional
+filters are `ward_code`, `sex`, inclusive `age_min`/`age_max`, `dedup_scope`, and
+`known_at`. Unknown codes, missing required inputs, invalid dates and inverted age
+ranges return HTTP 422. A missing validated dataset/unsupported store returns 503.
+There is no implicit reporting date until a replay clock is implemented.
+
+Each response returns `context` and `windows.rolling_28_days` / `rolling_12_months`:
+
+- Revision resolution and first-isolate selection are shared with the existing
+  reference processor. Each period selects independently. The default ward policy
+  remains `selected_cohort`; `all_wards` remains an explicit alternative.
+- Omitting the ward returns one combined all-wards cohort. It reselects first
+  isolates across wards; it does not add ward-specific denominators or percentages.
+- Age/sex filters apply **after** first-isolate selection. A later matching isolate
+  never replaces an earlier nonmatching or unknown one. Age comes from the selected
+  specimen's recorded age, not an estimate from birth year.
+- Metadata is joined by exact event ID. New corrections without enrichment remain
+  unknown; old-revision metadata is never reused. Without demographic filters those
+  isolates remain eligible. With a requested demographic filter, unknown records
+  are excluded and counted in `metadata.excluded_unknown`.
+- `metadata` also reports the retained count before demographic filtering, unknown
+  sex/age counts, and known nonmatching exclusions. Unknown counts describe the
+  population before demographic filtering and are not extra eligible isolates.
+
+| Status | Meaning |
+| --- | --- |
+| `not_applicable` | The dictionary explicitly restricts the drug to another specimen. |
+| `empty_cohort` | No eligible isolates after selection/filtering; inspect metadata exclusions too. |
+| `no_tests` | Eligible isolates exist, but none was tested against this drug. |
+| `insufficient_data` | Between 1 and 29 eligible tested isolates. |
+| `available` | At least 30 eligible tested isolates. |
+
+Only `available` exposes percentages and two-sided 95% Wilson score intervals.
+All other states retain counts and return null percentages and interval endpoints.
+Evidence values use 0-100 units and retain calculation precision for display rounding.
+The [Wilson formula](https://itl.nist.gov/div898/handbook/prc/section2/prc241.htm)
+describes uncertainty in the observed laboratory proportion, not treatment success.
+Screening drugs are labeled through `context.antibiotic_is_screening`.
+
+Coverage separates the source's observed date span from how much has been imported:
+
+- `source_date_span_covers_window` tests the requested bounds against the manifest's
+  observed source dates. `overlap_start`/`overlap_end` are null for disjoint periods.
+- `source_fully_imported` compares imported culture/enrichment counts to the full
+  manifest, so `--through` cannot silently claim a complete source import.
+- Actual imported culture bounds and expected/imported counts are returned separately.
+  These flags describe source files and database contents, not proof of real feed
+  completeness. They remain independent of the 30-isolate threshold and `known_at`.
+
+Both windows, metadata, dictionaries and coverage are read from one PostgreSQL
+repeatable-read snapshot, even while another request ingests new events. Responses
+are computed on demand; they are not saved analyses and have no replay run/revision
+or export ID yet. Other `/api/v1` routes in the implementation plan remain future work.
 
 ### Rolling-year definition
 
@@ -192,6 +264,8 @@ threshold, corrections, knowledge cutoffs, atomic conflicts, concurrent retries,
 append-only history, read-only SQLite migration, API behavior and the supplied data.
 Importer tests additionally cover ZIP/folder equivalence, short dates, validation,
 negative cultures, metadata revisions, concurrent imports and complete rollback.
+Evidence tests cover demographic selection, unknown metadata, combined ward counts,
+Wilson intervals, distinct suppression states, source coverage and concurrent snapshot reads.
 `python -m aei schema` prints the versioned input contract.
 
 Still pending: Flink processing, persisted result/alert history, alert definitions,

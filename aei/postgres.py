@@ -10,6 +10,7 @@ from psycopg import sql
 from psycopg.types.json import Jsonb
 
 from .dataset_store import import_bundle, initialize_dataset_tables
+from .evidence_source import read_evidence_snapshot
 from .models import IsolateEvent
 from .store import EventConflict
 
@@ -56,6 +57,9 @@ class PostgresEventStore:
 
     def import_dataset(self, bundle, through=None):
         return import_bundle(self, bundle, through)
+
+    def evidence_snapshot(self):
+        return read_evidence_snapshot(self)
 
     def append_many(self, events: Iterable[IsolateEvent]) -> tuple[int, int]:
         with self.connection() as db:
