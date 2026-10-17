@@ -310,7 +310,7 @@ def run(args):
         backend_env = {**os.environ, "AEI_DATABASE_URL": args.database_url, "AEI_DATABASE_SCHEMA": args.schema,
             "AEI_FEED_TOKEN": token, "AEI_CORS_ORIGINS": f"{dashboard},http://localhost:{args.frontend_port}",
             "PYTHONIOENCODING": "utf-8"}
-        frontend_env = {k: v for k, v in os.environ.items() if not k.startswith("AEI_")}
+        frontend_env = {k: v for k, v in os.environ.items() if not k.startswith(("AEI_", "OPENAI_"))}
         frontend_env.update(VITE_DATA_MODE="api", VITE_API_BASE_URL=f"{base}/api/v1", BROWSER="none")
         try:
             say(f"Starting backend at {base}; logs: {log_dir}")

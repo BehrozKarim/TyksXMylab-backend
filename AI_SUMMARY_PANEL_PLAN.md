@@ -1,6 +1,9 @@
 # AI summary panel: proposed development plan
 
-Status: planning only, 2026-10-17. No AI feature has been implemented by this plan.
+Status: first implementation added, 2026-10-17. See [AI_SUMMARY.md](AI_SUMMARY.md)
+for the implemented scope and configuration. The first version uses approved
+sentence composition, with model/provider evaluation and clinician review still pending.
+The sections below preserve the broader design proposal; they are not a completion checklist.
 
 ## 1. Purpose and first release
 

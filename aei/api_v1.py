@@ -27,9 +27,10 @@ from .publication import export_csv
 from .publication_models import (
     EvidenceRequest, ExpectedState, ReplayReset, ReplayStart, ReplayState, SavedEvidence, ServiceError,
 )
+from .summary_models import SavedSummary, SummaryRequest
 
 
-def replay_lifespan(service):
+def replay_lifespan(service, summaries=None):
     @asynccontextmanager
     async def lifespan(app):
         stopped = asyncio.Event()
@@ -47,6 +48,8 @@ def replay_lifespan(service):
 
         tasks = ([asyncio.create_task(run(tick)) for tick in (service.worker_tick, service.feed.worker_tick)]
                  if service is not None else [])
+        if summaries is not None:
+            tasks.append(asyncio.create_task(summaries.run(stopped)))
         try:
             yield
         finally:
@@ -56,7 +59,7 @@ def replay_lifespan(service):
     return lifespan
 
 
-def install_v1(app, service):
+def install_v1(app, service, summaries=None):
     origins = [value.strip() for value in os.environ.get(
         "AEI_CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",") if value.strip()]
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["GET", "POST"],
@@ -124,6 +127,22 @@ def install_v1(app, service):
         return service
 
     router = APIRouter(prefix="/api/v1")
+
+    @router.post("/ai/summaries", response_model=SavedSummary, status_code=202)
+    def create_summary(request: SummaryRequest, response: Response):
+        backend()
+        if summaries is None:
+            raise ServiceError(503, "summary_unavailable", "Summary service is unavailable")
+        result = summaries.request(request)
+        response.status_code = 200 if result.status == "ready" else 202
+        return result
+
+    @router.get("/ai/summaries/{summary_id}", response_model=SavedSummary)
+    def get_summary(summary_id: str):
+        backend()
+        if summaries is None:
+            raise ServiceError(503, "summary_unavailable", "Summary service is unavailable")
+        return summaries.get(summary_id)
 
     def feed_access(authorization: Annotated[str | None, Header()] = None):
         token = os.environ.get("AEI_FEED_TOKEN")
