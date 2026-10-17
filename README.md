@@ -8,8 +8,23 @@ PostgreSQL runs in Docker with a persistent
 volume. Annual results now mean **rolling last 12 calendar months**, alongside the
 rolling last 28 days. The backend includes configurable resistance alerts and
 investigation APIs, complete-culture feed ingestion and reconnectable live updates.
-Flink and a dashboard are not active yet. See [feed integration and the dashboard
-handoff](FEED_INTEGRATION.md) for the sender, API contract and EventSource example.
+The separate `TyksXMylab-frontend` consumes these APIs; Flink remains deferred.
+See [feed integration and the dashboard handoff](FEED_INTEGRATION.md) for the sender,
+API contract and EventSource example.
+
+## Run the app and synthetic feed together
+
+After the backend virtual environment and sibling frontend dependencies are installed:
+
+```powershell
+.\scripts\start-demo.ps1
+```
+
+The launcher starts Docker PostgreSQL, the backend, the dashboard and the HTTP dataset
+sender using a dedicated demo schema. Click **Send next lab batch** in the dashboard
+to deliver each batch; nothing is sent automatically. It resumes published progress; `-Restart` starts
+a fresh demo run while preserving saved reports. Ctrl+C stops its servers and leaves
+PostgreSQL running. See [DEMO.md](DEMO.md) for setup, source paths, ports and verification.
 
 ## Start the database and backend
 

@@ -5,6 +5,10 @@ delivery, a background worker publishes it, and Server-Sent Events (SSE) notify
 the dashboard after publication. Flink is deferred. The supplied-data sender is
 a separate HTTP client; a real laboratory adapter must implement the same contract.
 
+For a single-command app demonstration, run `scripts/start-demo.ps1`; see
+[DEMO.md](DEMO.md). The manual commands below remain useful for operating each part
+individually.
+
 ```text
 Laboratory adapter / dataset sender
   -> POST complete culture bundles -> durable PostgreSQL inbox -> 202 + receipt
