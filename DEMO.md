@@ -45,17 +45,18 @@ For the supplied dataset that is **24 September 2026**. The remaining records fo
 25-27 September arrive in batches of at most 20 cultures, retaining their original
 dates, identities and AST results. The reporting clock is explicitly simulated.
 
-After the dashboard starts, the simulator waits for a button click. **Demo controls**
-shows the next batch's culture count and date. Each click durably submits one batch;
+After the dashboard starts, the simulator waits for a button click. **Demo feed**
+in the header opens a panel showing the next batch's culture count and date. Each click durably submits one batch;
 the button stays disabled while publication is processing. On completion it shows
 the published count/revision and offers the next batch. Repeated clicks and requests
 from stale tabs cannot skip ahead: each click identifies the advertised delivery ID.
 There is no timer or automatic-feed toggle in this version.
 
 Open `/ward?date_mode=follow`, or select **Use latest date** if a report is pinned.
-The page should show **Synthetic live demo**, **Live updates connected** and
-**Receiving results**. Watch the report date and footer Snapshot number advance
-without reloading. Open **How calculated** to inspect the exact displayed revision.
+Watch the report date and evidence update without reloading. A batch may leave
+the date unchanged when another batch has the same source date. Open **How calculated**
+to inspect the exact displayed revision, run and source provenance. Technical source,
+connection and snapshot lines are not displayed above the page or in its footer.
 
 The terminal prints each published receipt, culture count, report date and revision.
 Browser developer tools can also show new `state` events on `/api/v1/updates` followed
@@ -63,13 +64,24 @@ by refreshed evidence requests. A percentage may stay the same if arrivals do no
 affect the selected population or first-isolate denominator. An insufficient-data
 message remains correct below 30 eligible tested isolates.
 
-At completion the dashboard stays open. **Receiving results** means the backend can
-still accept deliveries; it does not mean the finite simulator has more records.
-The panel shows **All demo batches published** and disables the button; the terminal
+At completion the dashboard stays open. The panel shows **All demo batches published** and disables the button; the terminal
 also reports **Demo complete**. Press **Ctrl+C** to stop the
 launcher and the backend/frontend processes it started. PostgreSQL and reports persist.
 
 ## Resume or restart
+
+The demo launcher uses `alerts.demo.json`: a **3-percentage-point** increase in
+resistance with at least **30 tested isolates in each period**. This is a proposed
+demonstration setting, not a clinically validated threshold. Ordinary API startup
+keeps the 10-point default. An explicit `AEI_ALERT_CONFIG` overrides the demo file.
+The frontend reads the threshold from the API; it does not calculate or fabricate
+alerts. In the supplied dataset, the 25 September 2026 Urology evaluation rises by
+about 3.81 points and triggers this demo rule.
+
+Alert configuration is frozen per run. When moving an existing demo from 10 to 3
+points, stop the launcher and use `-Restart` once. Earlier saved reports remain
+available with their original threshold. Starting a fresh default demo seeds on
+24 September; send the first batch to reach 25 September and review the alert.
 
 Run the same command again to resume the same demo. Published deliveries are skipped;
 pending deliveries keep their stable IDs and receipts. Reopening a completed demo

@@ -21,6 +21,7 @@ from psycopg import sql
 from psycopg.types.json import Jsonb
 
 from .config import database_url
+from .alert_models import load_alert_configuration
 from .dataset import load_bundle
 from .demo_control import DemoControls
 from .feed_sender import batches, send_batch
@@ -39,6 +40,13 @@ class DemoError(RuntimeError):
 
 def say(message):
     print(message, flush=True)
+
+
+def configure_demo_alerts():
+    """Use an explicit demo review threshold without changing ordinary API defaults."""
+    if not os.environ.get("AEI_ALERT_CONFIG"):
+        os.environ["AEI_ALERT_CONFIG"] = str(ROOT / "alerts.demo.json")
+    return load_alert_configuration()
 
 
 def resolve_source(explicit=None, root=ROOT):
@@ -292,6 +300,9 @@ def run(args):
     if (not all(1024 <= p <= 65535 for p in (args.backend_port, args.frontend_port))
             or args.backend_port == args.frontend_port):
         raise DemoError("Choose distinct backend/frontend ports between 1024 and 65535.")
+    alert_configuration = configure_demo_alerts()  # Validate before changing demo state.
+    say(f"Demo resistance review threshold: {alert_configuration.threshold_pp:g} percentage points "
+        "(proposed demo setting, not a clinically validated rule).")
     session = DemoSession(args.database_url, args.schema)
     source = resolve_source(args.source)
     frontend = args.frontend.resolve()

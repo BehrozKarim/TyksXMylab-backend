@@ -359,7 +359,10 @@ Existing run history is preserved. `{"monitors":[]}` disables monitors for a new
 Missing/invalid configuration files fail explicitly; duplicates and invalid thresholds
 are rejected. Unknown wards/organisms/drugs, screening drugs and incompatible specimen
 restrictions produce an explicit `unavailable` monitor with a reason, never a false alert.
-Threshold, baseline and monitor choices remain marked `proposed_pending_partner_confirmation`.
+Threshold, baseline and monitor choices remain marked `proposed_pending_partner_confirmation`. The separate demo launcher uses
+`alerts.demo.json` with a proposed 3-point demonstration threshold unless
+`AEI_ALERT_CONFIG` is explicitly provided; ordinary API startup remains 10 points.
+See `DEMO.md` for restarting an existing demo to apply that setting.
 
 Every run initialization and daily replay publication evaluates all monitors in the
 **same transaction** as the culture bundles, clock and revision, including empty dates.

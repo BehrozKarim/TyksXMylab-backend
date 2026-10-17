@@ -85,9 +85,9 @@ The local launcher continues to use `/__demo` as before.
    should increase. The dashboard should refresh through its SSE connection.
 4. Repeat the previous delivery ID: it must not publish another batch. All visitors
    share the same run; the button shows the current next batch.
-5. Open **AI summary**, then **Summarize this report**. Check the returned label:
+5. Click **AI summary** once to open the panel and start generation. Check the returned label:
    **AI-assisted summary** confirms model output; **Basic summary** is the existing
-   fallback. Opening the drawer alone does not call the provider.
+   fallback. Reopening a pending or completed summary reuses the same report-bound job.
 6. Restart the backend and confirm the published count and next batch are retained.
 
 Batch plans, receipts, saved analyses and AI jobs live in PostgreSQL. An accepted

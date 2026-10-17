@@ -21,7 +21,8 @@ import psycopg
 from psycopg import sql
 
 from aei.demo import (DemoError, DemoSession, Processes, deliver, demo_plan, free_port,
-                      install_interrupt_handlers, resolve_source, validate_frontend_dependencies)
+                      configure_demo_alerts, install_interrupt_handlers, resolve_source, validate_frontend_dependencies)
+from aei.alert_models import AlertConfiguration
 from aei.feed_models import FeedStart
 from aei.demo_control import DemoControls
 from aei.publication import PublicationService
@@ -31,6 +32,24 @@ from test_live_feed import live_server
 
 
 class DemoUnitTests(unittest.TestCase):
+    def test_demo_uses_three_point_threshold_without_changing_ordinary_defaults(self):
+        with patch.dict(os.environ, {}, clear=True):
+            demo = configure_demo_alerts()
+            self.assertEqual(demo.threshold_pp, 3)
+            self.assertEqual(demo.minimum_tested, 30)
+            self.assertEqual(demo.monitors, AlertConfiguration().monitors)
+        self.assertEqual(AlertConfiguration().threshold_pp, 10)
+
+    def test_explicit_alert_configuration_is_respected_and_invalid_path_fails(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'alerts.json'
+            path.write_text('{"threshold_pp": 7}', encoding='utf-8')
+            with patch.dict(os.environ, {'AEI_ALERT_CONFIG': str(path)}):
+                self.assertEqual(configure_demo_alerts().threshold_pp, 7)
+            with patch.dict(os.environ, {'AEI_ALERT_CONFIG': str(path.parent / 'missing.json')}):
+                with self.assertRaises(FileNotFoundError):
+                    configure_demo_alerts()
+
     def test_missing_new_font_dependency_fails_before_dashboard_startup(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

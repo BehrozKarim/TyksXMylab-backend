@@ -1,0 +1,11 @@
+{
+  "rule_version": "resistance-rise-v1",
+  "minimum_tested": 30,
+  "threshold_pp": 3,
+  "monitors": [
+    {"ward_code": "PHC-S", "organism": "Escherichia coli", "specimen": "urine", "antibiotic_code": "CIP"},
+    {"ward_code": "PHC-N", "organism": "Escherichia coli", "specimen": "urine", "antibiotic_code": "CIP"},
+    {"ward_code": "ED", "organism": "Escherichia coli", "specimen": "urine", "antibiotic_code": "CIP"},
+    {"ward_code": "URO", "organism": "Escherichia coli", "specimen": "urine", "antibiotic_code": "CIP"}
+  ]
+}
