@@ -6,9 +6,9 @@ services:
     plan: free
     region: frankfurt
     buildCommand: pip install -r requirements.txt
-    startCommand: python -m uvicorn aei.api:create_app --factory --host 0.0.0.0 --port $PORT --workers 1 --timeout-graceful-shutdown 60
+    # Free services use Render's default 30-second shutdown limit.
+    startCommand: python -m uvicorn aei.api:create_app --factory --host 0.0.0.0 --port $PORT --workers 1 --timeout-graceful-shutdown 20
     healthCheckPath: /health
-    maxShutdownDelaySeconds: 90
     envVars:
       - key: AEI_DATABASE_URL
         fromDatabase:
